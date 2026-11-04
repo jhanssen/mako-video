@@ -1,0 +1,6 @@
+/build*/
+/.cache/
+/.venv/
+/.venv-log/
+compile_commands.json
+__pycache__/

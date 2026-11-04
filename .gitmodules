@@ -1,0 +1,3 @@
+[submodule "external/mako-common"]
+	path = external/mako-common
+	url = ../mako-common.git

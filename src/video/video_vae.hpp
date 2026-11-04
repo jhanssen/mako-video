@@ -1,0 +1,55 @@
+#pragma once
+
+#include "models/runtime.hpp"
+
+#include <cstdint>
+#include <functional>
+#include <span>
+#include <string>
+#include <vector>
+
+namespace mako::video {
+
+// MiniMax-H3's video VAE decoder: a ViT over the latent voxels of a clip (one token each, plus four register tokens
+// and a zero token), 36 blocks of 32 heads of 64 with three-axis rotary positions, each token then a 16x16 patch of
+// four pixel frames. Latents are 16x smaller than the video and 4x fewer in time (17 frames encode to 5 latents),
+// decoded 7 latent frames (28 pixel frames) at a time in 256-pixel tiles whose overlaps are blended, consecutive clips
+// cross-faded over 5 frames, as the model was released. The weights are F16 here (F32 in the file).
+class VideoVae final : public models::TransformerRuntime {
+public:
+    // The video_vae directory: config.json (latents_mean / latents_std) and source/model.safetensors.
+    VideoVae(const std::string& dir, mtl::Context& ctx, gpu::Telemetry telemetry = gpu::Telemetry::off);
+
+    const char* name() const override { return "video VAE"; }
+
+    static constexpr uint32_t kLatent = 24, kPatch = 16, kPatchT = 4, kDim = 2048, kHeads = 32, kHeadDim = 64;
+    static constexpr uint32_t kRot = 48, kFfn = 8192, kRegisters = 4, kOut = 3 * kPatchT * kPatch * kPatch;
+    static constexpr uint32_t kClipLatents = 5, kClipOverlap = 2, kPrePad = 3, kFrameOverlap = 5;
+    static constexpr uint32_t kTile = 256, kTileOverlap = 64;
+
+    // A decoded frame: its index and its pixels [16 h][16 w][3] in [0, 1].
+    using FrameSink = std::function<void(uint32_t index, std::span<const float> rgb)>;
+    // The transformer's normalized latents as voxels [frames][h][w][24] (frames = 5 n + 2) to the video's 17 n + 5
+    // frames, delivered in order.
+    void decode(std::span<const float> latents, uint32_t frames, uint32_t h, uint32_t w, const FrameSink& sink);
+    static uint32_t pixel_frames(uint32_t latent_frames) { return (latent_frames - 2) / kClipLatents * 17 + 5; }
+
+private:
+    struct Block {
+        Tensor norm1, norm2, qkv, qkv_b, o, o_b, w1, w1_b, w2, w2_b, scale1, scale2;
+    };
+    // The ViT over a clip's voxels [f][th][tw][24] (denormalized, after the post-quant projection): pixels
+    // [4 f][16 th][16 tw][3] in the decoder's own (ImageNet-normalized) space.
+    void vit(std::span<const float> voxels, uint32_t f, uint32_t th, uint32_t tw, std::vector<float>& out);
+    // Tiles over `length` pixels: each tile's start and the overlap with the one before it (0 for the first).
+    struct Tile {
+        uint32_t start, size, overlap;
+    };
+    static std::vector<Tile> tiles(uint32_t length);
+
+    Tensor embed_, embed_b_, registers_, ones_, out_norm_w_, out_norm_b_, proj_out_, proj_out_b_;
+    std::vector<Block> blocks_;
+    std::vector<float> mean_, std_, pq_w_, pq_b_; // latent statistics; the post-quant 1x1 convolution
+};
+
+} // namespace mako::video

@@ -1,0 +1,521 @@
+#include "video/h3.hpp"
+
+#include "gguf/read_pool.hpp"
+#include "log/log.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <filesystem>
+#include <format>
+#include <stdexcept>
+
+namespace mako::video {
+
+namespace {
+
+struct RowModArgs {
+    uint32_t n;
+    float eps;
+    uint32_t shift_off, scale_off;
+};
+struct GateRowsArgs {
+    uint32_t n, gate_off;
+};
+
+constexpr float kEps = 1e-5f;
+constexpr uint32_t kFfn = 14336, kQkv = 3 * H3::kHeads * 128, kAdaln = 6 * 3 * H3::kDim, kModality = 6 * H3::kDim;
+constexpr uint32_t kOutRows = 256; // the velocity heads' rows, padded for the GEMM
+// Rotary time: a latent frame spans 5/3 of these units for each of its (1, 4, 4, 4, 4) pixel frames; a spatial axis
+// is normalized by the square root of the latent area and scaled by 32.
+constexpr double kFrameRescale = 5.0 / 3.0;
+constexpr int kFramesPerLatent[5] = {1, 4, 4, 4, 4};
+constexpr double kSpatialScale = 32.0;
+
+safetensors::Files open_files(const std::string& path)
+{
+    auto f = safetensors::Files::open(path);
+    if (!f)
+        throw std::runtime_error(f.error());
+    return std::move(*f);
+}
+
+} // namespace
+
+H3::H3(const std::string& path, mtl::Context& ctx, gpu::Telemetry telemetry) : TransformerRuntime(ctx, telemetry)
+{
+    const auto f = open_files(path);
+    // The shards interleave each head's q, k and v rows; the published single files stack them. Nothing in the file
+    // tells them apart.
+    interleaved_ = std::filesystem::is_directory(path);
+    load(f);
+}
+
+H3::Tensor H3::upload_qkv(const safetensors::Files& f, const std::string& name)
+{
+    const auto r = f.find(name);
+    if (!r || r.tensor->type != gguf::Type::BF16 || r.tensor->dims.size() != 2 || r.tensor->dims[0] != kDim ||
+        r.tensor->dims[1] != kQkv)
+        throw std::runtime_error(name + ": not the BF16 [21504][5376] fused q / k / v matrix");
+    if (!interleaved_)
+        return upload_raw(r.file->fd(), r.tensor->offset, r.tensor->bytes, gguf::Type::BF16, r.tensor->dims, name, true);
+    Tensor t = reserve(r.tensor->bytes, gguf::Type::BF16, r.tensor->dims);
+    char* dst = static_cast<char*>(t.buf->contents()) + t.off;
+    const uint64_t row = uint64_t(kDim) * 2, head = 128 * row;
+    std::vector<char> tmp(3 * head);
+    for (uint32_t h = 0; h < kHeads; ++h) { // head h's [q k v] rows to q, k and v's row blocks
+        gguf::read_exact(r.file->fd(), tmp.data(), tmp.size(), r.tensor->offset + uint64_t(h) * 3 * head);
+        for (uint32_t which = 0; which < 3; ++which)
+            std::memcpy(dst + (uint64_t(which) * kHeads + h) * head, tmp.data() + which * head, head);
+    }
+    return t;
+}
+
+H3::Tensor H3::upload_padded(const safetensors::Files& f, const std::string& name, uint32_t rows)
+{
+    const auto r = f.find(name);
+    if (!r || r.tensor->dims.size() != 2 || r.tensor->dims[1] > rows)
+        throw std::runtime_error(name + ": missing, or not a matrix of at most " + std::to_string(rows) + " rows");
+    const uint32_t k = uint32_t(r.tensor->dims[0]);
+    const auto v = models::read_floats(*r.file, *r.tensor);
+    Tensor t = reserve(uint64_t(rows) * k * 4, gguf::Type::F32, {k, rows});
+    auto* o = reinterpret_cast<float*>(static_cast<char*>(t.buf->contents()) + t.off);
+    std::fill(o, o + uint64_t(rows) * k, 0.0f);
+    std::copy(v.begin(), v.end(), o);
+    return t;
+}
+
+H3::Block H3::load_block(const safetensors::Files& f, const std::string& p, bool modulated)
+{
+    Block B;
+    B.norm1 = upload_f32(f, p + "norm1.weight");
+    B.norm2 = upload_f32(f, p + "norm2.weight");
+    B.qkv = upload_qkv(f, p + "attn.qkv_proj.weight");
+    B.o = upload(f, p + "attn.out_proj.weight", true);
+    B.norm_q = upload_f32(f, p + "attn.q_norm.weight");
+    B.norm_k = upload_f32(f, p + "attn.k_norm.weight");
+    B.fc1 = upload(f, p + "mlp.fc1.weight", true);
+    B.fc2 = upload(f, p + "mlp.fc2.weight", true);
+    if (B.o.dims[0] != kHeads * 128 || B.o.dims[1] != kDim || B.fc1.dims[0] != kDim || B.fc1.dims[1] != 2 * kFfn ||
+        B.fc2.dims[0] != kFfn || B.fc2.dims[1] != kDim || B.norm_q.dims[0] != 128)
+        throw std::runtime_error(p + ": unexpected shapes");
+    if (modulated) {
+        B.adaln = upload(f, p + "adaln_proj.linear.weight", true);
+        B.adaln_b = upload_f32(f, p + "adaln_proj.linear.bias");
+        if (B.adaln.dims[0] != kTimeDim || B.adaln.dims[1] != kAdaln)
+            throw std::runtime_error(p + ": the modulation projection is not [96768][2688] (a pruned checkpoint "
+                                         "replaces the time embedder by a table, which is not supported yet)");
+    }
+    return B;
+}
+
+void H3::load(const safetensors::Files& f)
+{
+    if (f.find("adaln_t_table"))
+        throw std::runtime_error("a pruned checkpoint (adaln_t_table): not supported yet");
+    if (!f.find("blocks.0.attn.qkv_proj.weight"))
+        throw std::runtime_error("transformer: not MiniMax-H3's weights");
+    for (uint32_t i = 0; f.find(std::format("token_refiner.blocks.{}.attn.qkv_proj.weight", i)); ++i)
+        refiner_.push_back(load_block(f, std::format("token_refiner.blocks.{}.", i), false));
+    refiner_norm_ = upload_f32(f, "token_refiner.final_norm.weight");
+    for (uint32_t i = 0; f.find(std::format("blocks.{}.attn.qkv_proj.weight", i)); ++i)
+        blocks_.push_back(load_block(f, std::format("blocks.{}.", i), true));
+    if (blocks_.empty() || refiner_.empty())
+        throw std::runtime_error("transformer: no blocks");
+    cond_ = upload(f, "condition_proj.weight", true);
+    cond_b_ = upload_f32(f, "condition_proj.bias");
+    // The patch projections, the time embedder and the heads are F32 in the checkpoint and stay so (the GEMM runs
+    // them in half).
+    video_in_ = upload(f, "video_patch_proj.weight", false);
+    video_in_b_ = upload_f32(f, "video_patch_proj.bias");
+    audio_in_ = upload(f, "audio_patch_proj.weight", false);
+    audio_in_b_ = upload_f32(f, "audio_patch_proj.bias");
+    t1_ = upload(f, "time_embedder.proj_in.weight", false);
+    t1_b_ = upload_f32(f, "time_embedder.proj_in.bias");
+    t2_ = upload(f, "time_embedder.proj_out.weight", false);
+    t2_b_ = upload_f32(f, "time_embedder.proj_out.bias");
+    final_adaln_ = upload(f, "final_layer.adaln_proj.linear.weight", true);
+    final_adaln_b_ = upload_f32(f, "final_layer.adaln_proj.linear.bias");
+    final_norm_ = upload_f32(f, "final_layer.norm.weight");
+    video_out_ = upload_padded(f, "final_layer.video_out.weight", kOutRows);
+    video_out_b_ = upload_f32(f, "final_layer.video_out.bias");
+    audio_out_ = upload_padded(f, "final_layer.audio_out.weight", kOutRows);
+    audio_out_b_ = upload_f32(f, "final_layer.audio_out.bias");
+    if (cond_.dims[0] != kText || cond_.dims[1] != kDim || video_in_.dims[0] != kVideoPatch ||
+        audio_in_.dims[0] != kAudioChannels || t1_.dims[0] != kTimeFreq || t1_.dims[1] != kDim ||
+        t2_.dims[0] != kDim || t2_.dims[1] != kTimeDim || final_adaln_.dims[1] != 2 * kDim ||
+        video_out_b_.dims[0] != kVideoPatch || audio_out_b_.dims[0] != kAudioChannels)
+        throw std::runtime_error("transformer: unexpected shapes");
+    log::info("MiniMax-H3 transformer: {} blocks, {} refiner blocks, {:.1f} GB", blocks_.size(), refiner_.size(),
+              double(dense_bytes_) / 1e9);
+}
+
+void H3::block(MTL::ComputeCommandEncoder*& enc, const Block& B, MTL::Buffer* x, uint32_t rows, uint32_t Tg,
+               MTL::Buffer* mods, uint64_t mods_off, MTL::Buffer* off, MTL::Buffer* cs)
+{
+    const uint32_t D = kDim, q_pad = round_up(rows, kAttnRows), k_pad = round_up(rows, 128);
+    MTL::Buffer* xn = scratch("d_xn", uint64_t(Tg) * D * 4);
+    MTL::Buffer* qkv = scratch("d_qkv", uint64_t(Tg) * kQkv * 4);
+    MTL::Buffer* qh = scratch("d_qh", uint64_t(kHeads) * q_pad * 128 * 2);
+    MTL::Buffer* kh = scratch("d_kh", uint64_t(kHeads) * k_pad * 128 * 2);
+    MTL::Buffer* vh = scratch("d_vh", uint64_t(kHeads) * k_pad * 128 * 2);
+    MTL::Buffer* att = scratch("d_att", uint64_t(Tg) * kHeads * 128 * 4);
+    MTL::Buffer* y = scratch("d_y", uint64_t(Tg) * D * 4);
+    MTL::Buffer* gu = scratch("d_gu", uint64_t(Tg) * 2 * kFfn * 4);
+    MTL::Buffer* ffm = scratch("d_ffm", uint64_t(Tg) * kFfn * 4);
+    // y = rms(x) * w * (1 + scale) + shift per row (the refiner: plain RMS norms).
+    auto norm_mod = [&](const Tensor& w, uint32_t shift, uint32_t scale) {
+        if (!mods) {
+            norm(enc, x, &w, xn, rows, D, D, kEps);
+            return;
+        }
+        const RowModArgs a{D, kEps, shift * D, scale * D};
+        enc->setComputePipelineState(pso("rms_mod_rows"));
+        enc->setBuffer(x, 0, 0);
+        enc->setBuffer(w.buf, w.off, 1);
+        enc->setBuffer(mods, mods_off, 2);
+        enc->setBuffer(off, 0, 3);
+        enc->setBuffer(xn, 0, 4);
+        enc->setBytes(&a, sizeof(a), 5);
+        enc->dispatchThreadgroups(MTL::Size(rows, 1, 1), MTL::Size(256, 1, 1));
+        after(enc, "rms_mod_rows");
+    };
+    auto gated = [&](uint32_t gate) {
+        if (!mods) {
+            add(enc, x, y, x, rows * D);
+            return;
+        }
+        const GateRowsArgs a{D, gate * D};
+        enc->setComputePipelineState(pso("gate_add_rows"));
+        enc->setBuffer(x, 0, 0);
+        enc->setBuffer(y, 0, 1);
+        enc->setBuffer(mods, mods_off, 2);
+        enc->setBuffer(off, 0, 3);
+        enc->setBytes(&a, sizeof(a), 4);
+        enc->dispatchThreads(MTL::Size(D, rows, 1), MTL::Size(256, 1, 1));
+        after(enc, "gate_add_rows");
+    };
+    norm_mod(B.norm1, 0, 1);
+    proj(enc, B.qkv, xn, 0, qkv, 0, Tg);
+    // Heads of 128 with their RMS norms, the first 96 values rotated (the refiner: no rotation).
+    heads_partial(enc, qkv, kQkv, 0, 128, 128, cs ? kRot : 0, kHeads, rows, q_pad, cs, &B.norm_q, kEps, qh);
+    heads_partial(enc, qkv, kQkv, kHeads * 128, 128, 128, cs ? kRot : 0, kHeads, rows, k_pad, cs, &B.norm_k, kEps,
+                  kh);
+    heads_partial(enc, qkv, kQkv, 2 * kHeads * 128, 128, 128, 0, kHeads, rows, k_pad, cs, nullptr, 0.0f, vh);
+    if (k_pad > rows) {
+        const uint32_t c[4] = {128, k_pad, rows, 0};
+        for (MTL::Buffer* b : {kh, vh})
+            dispatch(enc, "heads_clear", {b}, c, sizeof(c), MTL::Size(128, k_pad - rows, kHeads), MTL::Size(128, 1, 1));
+    }
+    attention(enc, qh, kh, vh, att, rows, q_pad, rows, k_pad, kHeads, kHeads, 0, 0);
+    proj(enc, B.o, att, 0, y, 0, Tg);
+    gated(2);
+    norm_mod(B.norm2, 3, 4);
+    proj(enc, B.fc1, xn, 0, gu, 0, Tg);
+    uint32_t nff = kFfn;
+    dispatch(enc, "swiglu_rows", {gu, ffm}, &nff, sizeof(nff), MTL::Size(nff, Tg, 1), MTL::Size(256, 1, 1));
+    proj(enc, B.fc2, ffm, 0, y, 0, Tg);
+    gated(5);
+}
+
+void H3::begin(std::span<const float> text, const Layout& l)
+{
+    if (!l.text || text.size() != uint64_t(l.text) * kText)
+        throw std::runtime_error("text embeddings must be rows of 5120");
+    if (!l.frames || !l.h || !l.w || l.h % 2 || l.w % 2 || !l.audio)
+        throw std::runtime_error("layout: frames, an even latent height and width, and audio latents");
+    if (!l.text_tags.empty() && l.text_tags.size() != l.text)
+        throw std::runtime_error("layout: a tag per text row");
+    if (l.cond_last.size() != l.cond_frames)
+        throw std::runtime_error("layout: an anchor per conditioning frame");
+    layout_ = l;
+    cond_rows_ = l.cond_rows();
+    S_ = l.rows();
+    const uint32_t T = l.text, S = S_, Tg = round_up(T, 256);
+    MTL::Buffer* tx = scratch("k_tx", uint64_t(T) * kText * 4);
+    MTL::Buffer* txt = scratch("k_txt", uint64_t(Tg) * kDim * 4);
+    std::memcpy(tx->contents(), text.data(), text.size() * 4);
+    std::memset(txt->contents(), 0, txt->length());
+    MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
+    cur_cb_ = cb;
+    MTL::ComputeCommandEncoder* enc = encoder(cb, 0, -1);
+    proj(enc, cond_, tx, 0, txt, 0, Tg > T ? Tg : T);
+    bias(enc, txt, cond_b_, kDim, T);
+    for (const Block& B : refiner_)
+        block(enc, B, txt, T, Tg, nullptr, 0, nullptr, nullptr);
+    norm(enc, txt, &refiner_norm_, txt, T, kDim, kDim, kEps);
+    probe(enc, "txt", -1, txt, uint64_t(T) * kDim);
+    enc->endEncoding();
+    finish(cb);
+
+    // Tags and rotary positions of every row, (t, h, w) in double as the reference lays them out, the angles in
+    // float: the text on the time axis at its row index, the media rows continuing from there (audio one unit a
+    // latent, the video 5/3 x (1, 4, 4, 4, 4) units a latent frame), the spatial axes centred on the unit square
+    // times 32.
+    tags_.assign(S, kVideoTag);
+    for (uint32_t i = 0; i < T; ++i)
+        tags_[i] = l.text_tags.empty() ? kTextTag : l.text_tags[i];
+    const uint32_t A = l.audio_rows(), rpf = l.rows_per_frame(), ph = l.h / 2, pw = l.w / 2;
+    for (uint32_t i = 0; i < A; ++i)
+        tags_[T + cond_rows_ + i] = kAudioTag;
+    std::vector<double> pos(uint64_t(S) * 3, 0.0);
+    for (uint32_t i = 0; i < T; ++i)
+        pos[uint64_t(i) * 3] = i;
+    const double sqrt_area = std::sqrt(double(l.h) * double(l.w));
+    auto grid = [&](uint32_t dim, uint32_t n, uint32_t i) {
+        const double ratio = double(dim) / sqrt_area, left = (1.0 - ratio) / 2.0;
+        return (left + double(i) * (ratio / double(n))) * kSpatialScale;
+    };
+    std::vector<double> spans(l.frames);
+    for (uint32_t f = 0; f < l.frames; ++f)
+        spans[f] = kFrameRescale * kFramesPerLatent[f % 5];
+    const double origin = double(T);
+    // Keyframe anchors: the first generated frame's time, or the last's.
+    for (uint32_t c = 0; c < l.cond_frames; ++c) {
+        double t = origin;
+        if (l.cond_last[c]) {
+            double sum = 0;
+            for (double s : spans)
+                sum += s;
+            t = origin + sum - kFrameRescale;
+        }
+        for (uint32_t y = 0; y < ph; ++y)
+            for (uint32_t x = 0; x < pw; ++x) {
+                double* p = &pos[(uint64_t(T) + c * rpf + y * pw + x) * 3];
+                p[0] = t;
+                p[1] = grid(l.h, ph, y);
+                p[2] = grid(l.w, pw, x);
+            }
+    }
+    for (uint32_t ch = 0; ch < 2; ++ch)
+        for (uint32_t j = 0; j < l.audio; ++j) {
+            double* p = &pos[(uint64_t(T) + cond_rows_ + ch * l.audio + j) * 3];
+            p[0] = origin + double(j);
+            p[2] = grid(l.w, pw, ch ? pw - 1 : 0);
+        }
+    double t = origin;
+    for (uint32_t f = 0; f < l.frames; ++f) {
+        for (uint32_t y = 0; y < ph; ++y)
+            for (uint32_t x = 0; x < pw; ++x) {
+                double* p = &pos[(uint64_t(T) + cond_rows_ + A + f * rpf + y * pw + x) * 3];
+                p[0] = t;
+                p[1] = grid(l.h, ph, y);
+                p[2] = grid(l.w, pw, x);
+            }
+        t += spans[f];
+    }
+    MTL::Buffer* cs = scratch("k_cs", uint64_t(S) * (kRot / 2) * 8);
+    auto* c = static_cast<float*>(cs->contents());
+    float inv[kRopeFreqs];
+    for (uint32_t j = 0; j < kRopeFreqs; ++j)
+        inv[j] = 1.0f / std::pow(kRopeTheta, float(2 * j) / float(2 * kRopeFreqs));
+    for (uint32_t r = 0; r < S; ++r)
+        for (uint32_t axis = 0; axis < 3; ++axis)
+            for (uint32_t j = 0; j < kRopeFreqs; ++j) {
+                const float ang = float(pos[uint64_t(r) * 3 + axis]) * inv[j];
+                const uint64_t o = (uint64_t(r) * (kRot / 2) + axis * kRopeFreqs + j) * 2;
+                c[o] = std::cos(ang);
+                c[o + 1] = std::sin(ang);
+            }
+}
+
+H3::Velocity H3::step(std::span<const float> video, std::span<const float> audio, float t_video, float t_audio,
+                      float t_cond)
+{
+    const Layout& l = layout_;
+    const uint32_t T = l.text, S = S_, A = l.audio_rows(), V = l.video_rows(), C = cond_rows_, D = kDim;
+    if (!S)
+        throw std::runtime_error("begin() first");
+    if (video.size() != uint64_t(V) * kVideoPatch || audio.size() != uint64_t(A) * kAudioChannels)
+        throw std::runtime_error("video rows of 96 and audio rows of 32 as the layout has them");
+    const uint32_t Tg = round_up(S, 256), nb = uint32_t(blocks_.size());
+    // The distinct timesteps, sorted, and each row's (timestep, tag) modulation: row offsets into a block's [U][96768]
+    // modulation output, and into the final layer's [U][10752].
+    std::vector<float> ts = {t_video, t_audio};
+    if (C)
+        ts.push_back(t_cond);
+    std::ranges::sort(ts);
+    ts.erase(std::unique(ts.begin(), ts.end()), ts.end());
+    const uint32_t U = uint32_t(ts.size());
+    auto index = [&](float t) { return uint32_t(std::ranges::find(ts, t) - ts.begin()); };
+    std::vector<uint32_t> off(S), off2(S);
+    for (uint32_t r = 0; r < S; ++r) {
+        const uint32_t tag = tags_[r];
+        const float t = r < T ? t_video : r < T + C ? t_cond : tag == kAudioTag ? t_audio : t_video;
+        const uint32_t u = index(t);
+        off[r] = u * kAdaln + tag * kModality;
+        off2[r] = u * 2 * D;
+    }
+    MTL::Buffer* offb = scratch("d_off", uint64_t(S) * 4);
+    MTL::Buffer* off2b = scratch("d_off2", uint64_t(S) * 4);
+    std::memcpy(offb->contents(), off.data(), off.size() * 4);
+    std::memcpy(off2b->contents(), off2.data(), off2.size() * 4);
+    // The sinusoidal embedding of each timestep (cos half first), unscaled.
+    MTL::Buffer* tp = scratch("d_tp", uint64_t(U) * kTimeFreq * 4);
+    auto* tpf = static_cast<float*>(tp->contents());
+    for (uint32_t u = 0; u < U; ++u)
+        for (uint32_t i = 0; i < kTimeFreq / 2; ++i) {
+            const float freq = std::exp(-std::log(10000.0f) * float(i) / float(kTimeFreq / 2));
+            const float arg = ts[u] * freq;
+            tpf[u * kTimeFreq + i] = std::cos(arg);
+            tpf[u * kTimeFreq + kTimeFreq / 2 + i] = std::sin(arg);
+        }
+    MTL::Buffer* th = scratch("d_th", uint64_t(U) * D * 4);
+    MTL::Buffer* temb = scratch("d_temb", uint64_t(U) * kTimeDim * 4);
+    MTL::Buffer* mods = scratch("d_mods", uint64_t(nb) * U * kAdaln * 4);
+    MTL::Buffer* fmods = scratch("d_fmods", uint64_t(U) * 2 * D * 4);
+    MTL::Buffer* x = scratch("d_x", uint64_t(Tg) * D * 4);
+    MTL::Buffer* xn = scratch("d_xn", uint64_t(Tg) * D * 4);
+    MTL::Buffer* vin = scratch("d_vin", uint64_t(V) * kVideoPatch * 4);
+    MTL::Buffer* ain = scratch("d_ain", uint64_t(A) * kAudioChannels * 4);
+    MTL::Buffer* vout = scratch("d_vout", uint64_t(V - C) * kOutRows * 4);
+    MTL::Buffer* aout = scratch("d_aout", uint64_t(A) * kOutRows * 4);
+    MTL::Buffer* txt = scratch("k_txt", uint64_t(round_up(T, 256)) * D * 4);
+    MTL::Buffer* cs = scratch("k_cs", uint64_t(S) * (kRot / 2) * 8);
+    std::memcpy(vin->contents(), video.data(), video.size() * 4);
+    std::memcpy(ain->contents(), audio.data(), audio.size() * 4);
+    std::memset(x->contents(), 0, x->length());
+    std::memcpy(x->contents(), txt->contents(), uint64_t(T) * D * 4);
+
+    // At the layers and kernels telemetry levels, the step's GPU time per kernel.
+    const bool timing = tel_ >= gpu::Telemetry::layers;
+    MTL::Timestamp cpu0 = 0, gpu0 = 0;
+    if (timing) {
+        add_samples(32768);
+        ctx_.device()->sampleTimestamps(&cpu0, &gpu0);
+    }
+    MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
+    cur_cb_ = cb;
+    MTL::ComputeCommandEncoder* enc = encoder(cb, 0, -1);
+    // The time embedding of each distinct timestep, and silu of it into every block's modulation projection (its
+    // input rounded to BF16 as the projection takes it) and the final layer's.
+    proj(enc, t1_, tp, 0, th, 0, U);
+    bias(enc, th, t1_b_, D, U);
+    unary(enc, "silu", th, U * D);
+    proj(enc, t2_, th, 0, temb, 0, U);
+    bias(enc, temb, t2_b_, kTimeDim, U);
+    probe(enc, "temb", -1, temb, uint64_t(U) * kTimeDim);
+    unary(enc, "silu", temb, U * kTimeDim);
+    for (uint32_t b = 0; b < nb; ++b) {
+        const uint64_t o = uint64_t(b) * U * kAdaln * 4;
+        proj(enc, blocks_[b].adaln, temb, 0, mods, o, U);
+        bias(enc, mods, blocks_[b].adaln_b, kAdaln, U, o);
+    }
+    proj(enc, final_adaln_, temb, 0, fmods, 0, U);
+    bias(enc, fmods, final_adaln_b_, 2 * D, U);
+    probe(enc, "mod0", -1, mods, uint64_t(U) * kAdaln);
+    // The rows: [text | conditioning video | audio | video], the media through their patch projections.
+    if (C) {
+        proj(enc, video_in_, vin, 0, x, uint64_t(T) * D * 4, C);
+        bias(enc, x, video_in_b_, D, C, uint64_t(T) * D * 4);
+    }
+    proj(enc, audio_in_, ain, 0, x, uint64_t(T + C) * D * 4, A);
+    bias(enc, x, audio_in_b_, D, A, uint64_t(T + C) * D * 4);
+    proj(enc, video_in_, vin, uint64_t(C) * kVideoPatch * 4, x, uint64_t(T + C + A) * D * 4, V - C);
+    bias(enc, x, video_in_b_, D, V - C, uint64_t(T + C + A) * D * 4);
+    probe(enc, "x0", -1, x, uint64_t(S) * D);
+    for (uint32_t b = 0; b < nb; ++b) {
+        cur_layer_ = b;
+        block(enc, blocks_[b], x, S, Tg, mods, uint64_t(b) * U * kAdaln * 4, offb, cs);
+        probe(enc, "block", int(b), x, uint64_t(S) * D);
+    }
+    {
+        const RowModArgs a{D, kEps, 0, D};
+        enc->setComputePipelineState(pso("rms_mod_rows"));
+        enc->setBuffer(x, 0, 0);
+        enc->setBuffer(final_norm_.buf, final_norm_.off, 1);
+        enc->setBuffer(fmods, 0, 2);
+        enc->setBuffer(off2b, 0, 3);
+        enc->setBuffer(xn, 0, 4);
+        enc->setBytes(&a, sizeof(a), 5);
+        enc->dispatchThreadgroups(MTL::Size(S, 1, 1), MTL::Size(256, 1, 1));
+        after(enc, "rms_mod_rows");
+    }
+    probe(enc, "norm_out", -1, xn, uint64_t(S) * D);
+    proj(enc, video_out_, xn, uint64_t(T + C + A) * D * 4, vout, 0, V - C);
+    proj(enc, audio_out_, xn, uint64_t(T + C) * D * 4, aout, 0, A);
+    enc->endEncoding();
+    finish(cb);
+    if (timing) {
+        std::vector<gpu::KernelTime> parts, kernels;
+        resolve_times(cpu0, gpu0, [](uint32_t, int, double) {}, parts, kernels);
+        std::ranges::sort(kernels, [](const gpu::KernelTime& a, const gpu::KernelTime& b) { return a.ms > b.ms; });
+        double total = 0;
+        for (const auto& k : kernels)
+            total += k.ms;
+        log::info("step of {} rows: {:.0f} ms of GPU time in {} kernels", S, total, kernels.size());
+        for (size_t i = 0; i < std::min<size_t>(kernels.size(), 16); ++i)
+            log::info("  {:7.0f} ms  {:5} x  {}", kernels[i].ms, kernels[i].count, kernels[i].kernel);
+    }
+
+    // The heads' rows are padded to 256: the first 96 / 32 of each, plus the bias.
+    Velocity v;
+    v.video.assign(uint64_t(V) * kVideoPatch, 0.0f);
+    v.audio.resize(uint64_t(A) * kAudioChannels);
+    const auto* vo = static_cast<const float*>(vout->contents());
+    const auto* vb = reinterpret_cast<const float*>(static_cast<const char*>(video_out_b_.buf->contents()) +
+                                                    video_out_b_.off);
+    for (uint32_t r = 0; r < V - C; ++r)
+        for (uint32_t i = 0; i < kVideoPatch; ++i)
+            v.video[uint64_t(C + r) * kVideoPatch + i] = vo[uint64_t(r) * kOutRows + i] + vb[i];
+    const auto* ao = static_cast<const float*>(aout->contents());
+    const auto* ab = reinterpret_cast<const float*>(static_cast<const char*>(audio_out_b_.buf->contents()) +
+                                                    audio_out_b_.off);
+    for (uint32_t r = 0; r < A; ++r)
+        for (uint32_t i = 0; i < kAudioChannels; ++i)
+            v.audio[uint64_t(r) * kAudioChannels + i] = ao[uint64_t(r) * kOutRows + i] + ab[i];
+    return v;
+}
+
+H3::Tensor* H3::lora_bias(const std::string&) { return nullptr; }
+
+H3::LoraTarget H3::lora_target(const std::string& module)
+{
+    // Diffusers' names (transformer_blocks.N.attn.to_q, ff.net.0.proj, ...) or the checkpoint's own.
+    static constexpr std::pair<const char*, const char*> kParts[] = {
+        {".attn.to_q", ".attn.q"},       {".attn.to_k", ".attn.k"},       {".attn.to_v", ".attn.v"},
+        {".attn.to_out.0", ".attn.out_proj"}, {".ff.net.0.proj", ".mlp.fc1"}, {".ff.net.2", ".mlp.fc2"},
+        {".adaln_proj.linear", ".adaln"}};
+    std::string m = module;
+    for (const char* p : {"transformer_blocks.", "token_refiner.refiner_blocks."})
+        if (m.starts_with(p)) {
+            m = (std::string_view(p) == "transformer_blocks." ? "blocks." : "token_refiner.blocks.") +
+                m.substr(std::strlen(p));
+            break;
+        }
+    for (const auto& [d, o] : kParts)
+        if (const size_t at = m.find(d); at != std::string::npos)
+            m.replace(at, std::strlen(d), o);
+    Block* B = nullptr;
+    std::string_view rest;
+    unsigned i = 0;
+    int used = 0;
+    if (std::sscanf(m.c_str(), "blocks.%u.%n", &i, &used) == 1 && used > 0 && i < blocks_.size()) {
+        B = &blocks_[i];
+        rest = std::string_view(m).substr(size_t(used));
+    } else if (std::sscanf(m.c_str(), "token_refiner.blocks.%u.%n", &i, &used) == 1 && used > 0 &&
+               i < refiner_.size()) {
+        B = &refiner_[i];
+        rest = std::string_view(m).substr(size_t(used));
+    }
+    if (!B)
+        return {};
+    const uint32_t hd = kHeads * 128;
+    if (rest == "attn.q")
+        return {&B->qkv, 0, hd};
+    if (rest == "attn.k")
+        return {&B->qkv, hd, hd};
+    if (rest == "attn.v")
+        return {&B->qkv, 2 * hd, hd};
+    if (rest == "attn.out_proj")
+        return {&B->o, 0, kDim};
+    if (rest == "mlp.fc1") // the adapter's rows [value; gate] onto the weights' [gate; value]
+        return {&B->fc1, 0, 2 * kFfn, kFfn};
+    if (rest == "mlp.fc2")
+        return {&B->fc2, 0, kDim};
+    if (rest == "adaln" && B->adaln.buf)
+        return {&B->adaln, 0, kAdaln};
+    return {};
+}
+
+} // namespace mako::video
