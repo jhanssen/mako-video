@@ -174,7 +174,12 @@ curl -s localhost:8083/v1/videos/video_1762300000_1/content -o fox.mp4
 - `tools/pi/scene-video` is a pi skill that turns the conversation into a video prompt and makes the video through
   this server (`ln -s "$PWD/tools/pi/scene-video" ~/.pi/agent/skills/`; then ask for a video of the scene). Its
   `scripts/render.sh` posts the job, follows it and prints the MP4's path; `models.sh` and `loras.sh` list the
-  choices.
+  choices. Prompts follow MiniMax's own format (the "Context-IR" the model was trained on: an
+  `integrated_multimodal_description` timeline in `[Shot N]`s with camera vocabulary and `<d>` dialogue, an
+  `overall_soundscape` and a `non_diegetic_music`; keyframe alignment lines; a six-section form with `<Picture N>`,
+  `<Video N>`, `<Audio N>` labels for references), summarized in the skill and spelled out in MiniMax's own
+  `h3-prompt-writing` skill (github.com/MiniMax-AI/MiniMax-H3, `skills/`), which the scene-video skill reads when it
+  is installed beside it. The model card's `docs/VIDEO_PROMPT_WRITING_GUIDE_*.md` are the same text.
 
 ## Tests
 
