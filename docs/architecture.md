@@ -52,7 +52,7 @@ yet). Rows at different levels run in one forward.
 - 50 blocks: RMS norm with weight times (1 + scale) plus shift, per row; q / k / v in one GEMM (the shards store the
   fused matrix with each head's rows interleaved, `upload_qkv` stacks them q, k, v so LoRAs land on contiguous rows),
   RMS norms per head, rotary positions, full bidirectional flash attention over 56 heads of 128
-  (`flash_attn_sg_128_16x32_4`, streaming keys, so 40k rows need no score matrix), the output projection times the
+  (`flash_attn_coop_128_32`, streaming keys, so 40k rows need no score matrix), the output projection times the
   row's gate added back; the same for the SwiGLU FFN (fc1 [gate; value] 28672 rows, fc2 from 14336).
 - The final RMS norm modulated per row by its level (shift, scale), the F32 heads (5376 -> 96 video, 5376 -> 32
   audio; padded to 256 rows for the GEMM) over their rows.

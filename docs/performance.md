@@ -14,13 +14,13 @@ Measured on an M5 Max (128 GB, 40-core GPU), the FL2VA checkpoint with the light
 | 256x256, 124 frames: forwards 2 to 8 | 2.8-2.9 s each |
 | Video decode, 256x256 x 124 frames (7 clips of one tile) | 4.3 s |
 | Audio decode, 5.2 s stereo | 0.7 s |
-| 1344x768, 124 frames (37296 video rows, 38 k in all): first forward | 149 s (was 231) |
-| 1344x768, 124 frames: later forwards (thermal state "fair" throughout) | 128 s each (was 173-179) |
+| 1344x768, 124 frames (37296 video rows, 38 k in all): first forward | 145 s (was 149, before that 231) |
+| 1344x768, 124 frames: later forwards (thermal state "fair" throughout) | 125 s each (was 128, 173-179) |
 | Video decode, 1344x768 x 124 frames (7 clips of 4 x 7 tiles) | 69 s |
-| 1344x768, 124 frames, 8 forwards, end to end | about 19 min (was 25.6) |
+| 1344x768, 124 frames, 8 forwards, end to end | about 18.5 min from the forward times (19 measured with the previous attention; 25.6 before the tiles) |
 
-The "was" numbers are from before the dense BF16 GEMM moved to 64 x 128 tiles and the attention to 64 keys a pass
-(mako-common, below).
+The "was" numbers are from before the dense BF16 GEMM moved to 64 x 128 tiles and the attention to 64 keys a pass,
+then to the cooperative kernel (mako-common, below).
 
 The first forward of a run costs about 20 s more than the others (scratch buffers allocated and wired; at 960x544 the
 GPU time was 47 s of a 67 s step). Loading the transformer after the text encoder has been freed brought it down from
@@ -28,20 +28,23 @@ the 60 s it was when the transformer had been loaded first and then displaced.
 
 ## Where a forward goes (960x544, 124 frames: 19308 rows, `--telemetry kernels`)
 
-Two forwards each, the second in the "fair" thermal state; before and after the tile changes.
+Two forwards each, the second in the "fair" thermal state; before the tile changes, after them, and with the
+cooperative attention kernel.
 
-| Kernel | GPU time a forward, before | after |
-| --- | ---: | ---: |
-| flash attention (50 x; 16x32 keys a pass, then 16x64) | 24.8-26.5 s | 19.7-21.6 s |
-| gemm BF16 5376x28672 (fc1, 50 x) | 7.1-8.4 s | 6.8-7.3 s |
-| gemm BF16 5376x21504 (q, k, v, 50 x) | 5.4-6.2 s | 5.3-6.1 s |
-| gemm BF16 14336x5376 (fc2, 50 x) | 6.3-8.1 s | 3.7-4.1 s |
-| gemm BF16 7168x5376 (out, 50 x) | 2.1-3.1 s | 1.7-1.8 s |
-| heads_partial, swiglu_rows, gate_add_rows, rms_mod_rows | 1.3-1.5 s | 1.4-1.5 s |
-| gemm BF16 2688x96768 (the AdaLN projections, 50 x) | 70-85 ms | 70-80 ms |
-| total | 47-54 s | 39-43 s |
+| Kernel | GPU time a forward, before | tiles | cooperative attention |
+| --- | ---: | ---: | ---: |
+| flash attention (50 x; 16x32 keys a pass, 16x64, then 64 rows x 32 keys cooperative) | 24.8-26.5 s | 19.7-21.6 s | 17.2-19.4 s |
+| gemm BF16 5376x28672 (fc1, 50 x) | 7.1-8.4 s | 6.8-7.3 s | 6.2-7.3 s |
+| gemm BF16 5376x21504 (q, k, v, 50 x) | 5.4-6.2 s | 5.3-6.1 s | 4.7-5.9 s |
+| gemm BF16 14336x5376 (fc2, 50 x) | 6.3-8.1 s | 3.7-4.1 s | 3.3-4.0 s |
+| gemm BF16 7168x5376 (out, 50 x) | 2.1-3.1 s | 1.7-1.8 s | 1.6-1.8 s |
+| heads_partial, swiglu_rows, gate_add_rows, rms_mod_rows | 1.3-1.5 s | 1.4-1.5 s | 1.3-1.5 s |
+| gemm BF16 2688x96768 (the AdaLN projections, 50 x) | 70-85 ms | 70-80 ms | 70-80 ms |
+| total | 47-54 s | 39-43 s | 34-40 s |
 
-Attention is half the step at 19 k rows and, growing with the square of the rows, about 60% at 38 k (1344x768).
+Attention is half the step at 19 k rows and, growing with the square of the rows, about 60% at 38 k (1344x768). In
+the model it runs at 340-390 ms a call (56 heads, 19305 rows), slower than the same shape in the bench below
+(300 ms); not investigated.
 
 ### The dense GEMM's tiles (mako-common `bench/dense_gemm_bench`, random BF16, cool GPU)
 
@@ -64,15 +67,37 @@ so the 128-wide tile halves it. 256-row tiles (8 simdgroups) and 128 x 128 were 
 
 ### Attention variants (mako-common `bench/attn_bench`, 56 heads of 128, random inputs)
 
+Each simdgroup alone over 16 query rows, scores through a float buffer in threadgroup memory (`flash_attn_sg`):
+
 | Kernel (rows a simdgroup x keys a pass, simdgroups) | 19308 x 19308 | 4096 x 4122 (32 heads) |
 | --- | ---: | ---: |
-| 16 x 32, 4 (the kernel so far) | 384 ms, 27.8 TFLOP/s | 7.3 ms, 38.1 |
-| 16 x 64, 4 (now, for 128-wide heads) | 336 ms, 31.8 | 7.2 ms, 38.2 |
+| 16 x 32, 4 (the kernel until the tile changes) | 384 ms, 27.8 TFLOP/s | 7.3 ms, 38.1 |
+| 16 x 64, 4 (after them) | 336 ms, 31.8 | 7.2 ms, 38.2 |
 | 16 x 32, 8 | 431 ms, 24.8 | 7.2 ms, 38.2 |
 | 16 x 128, 2 | 526 ms, 20.3 | 11.4 ms, 24.3 |
 
-Each simdgroup works alone over 16 query rows, its output accumulator (16 x 128 floats) in registers; 32 rows a
-simdgroup spills (30-36 ms at 4 k, measured for the image models), and 128 keys a pass with 4 simdgroups needs more
-threadgroup memory than the 32 KB there is for the scores. So the kernel's rate is set by matmul2d on 16-row tiles,
-about 30 TFLOP/s against the GEMM's 60; the next step up is a different kernel (scores kept as half so 128 keys fit,
-or the softmax computed on the cooperative tensor without the float score buffer), untried.
+Its output accumulator (16 x 128 floats) is in registers; 32 rows a simdgroup spills (30-36 ms at 4 k, measured for
+the image models), and 128 keys a pass with 4 simdgroups needs more threadgroup memory than the 32 KB there is for
+the scores. matmul2d on 16-row tiles runs at 49 TFLOP/s against 64 on 32 or 64-row ones (`bench/mm_rate_bench`).
+
+The kernels tried next (mako-common `bench/attn_ct.metal`, `xp_flash_attn_...`) keep the scores in the matmul's
+cooperative tensor and do the softmax there, so only P (half) goes through threadgroup memory:
+
+| Kernel | 19308 x 19308 | 4096 x 4122 (32 heads) | 38000 x 38000 |
+| --- | ---: | ---: | ---: |
+| 16 x 64, 4, softmax on the tensor | 348-407 ms | | |
+| 64 rows cooperative over 4 simdgroups, 32 keys a pass (now: `flash_attn_coop`) | 297-304 ms, 35.4 TFLOP/s | 6.6 ms, 42.2 | 1176-1294 ms, 32-35 (16 x 64: 1368, 30.3) |
+| the same, 64 keys a pass (spills) | 427-485 ms | 10.2 ms | |
+| the same, two 32-key products a pass (one maximum exchange per 64 keys) | 457 ms | 10.9 ms | |
+| the same, K and V staged in threadgroup memory, K a pass ahead | 285 ms, 37.5 | 6.9 ms | 1324 ms |
+| 64 rows cooperative over 8 simdgroups, 64 / 128 keys a pass | 327 / 363 ms | | |
+| `flash_attn_coop` reading key block 0 every pass (compute only) | 207 ms, 51.7 | | 928 ms, 44.6 |
+| `flash_attn_coop` without the maximum exchange (wrong, timing only) | 303 ms | | 1287 ms |
+
+The cooperative kernel's Q K^T and P V are one matmul2d each over the threadgroup's four simdgroups, so they run on
+64-row tiles; a 64 x N result is a 2 x 2 grid of 32 x N/2 blocks over the simdgroups, so a row's scores sit in two
+of them and its maximum is exchanged through threadgroup memory once a pass (two barriers a pass with P
+double-buffered). The exchange costs nothing measurable; what separates 302 ms from the compute-only 207 is the
+key and value streaming (each row read by two simdgroups a threadgroup, 302 threadgroups a head), and staging the
+tiles in threadgroup memory recovers part of it at 19 k rows but loses at 38 k. 64-wide heads (32 heads at 1797
+keys, the image models' text encoders): 2.2-2.3 ms against 2.3-3.0 for 16 x 32 (noise-level at that size).
