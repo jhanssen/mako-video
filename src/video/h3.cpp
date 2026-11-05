@@ -139,17 +139,16 @@ H3::Block H3::load_block(const safetensors::Files& f, const std::string& p, bool
     if (modulated) {
         B.adaln = upload(f, p + "adaln_proj.linear.weight", true);
         B.adaln_b = upload_f32(f, p + "adaln_proj.linear.bias");
-        if (B.adaln.dims[0] != kTimeDim || B.adaln.dims[1] != kAdaln)
-            throw std::runtime_error(p + ": the modulation projection is not [96768][2688] (a pruned checkpoint "
-                                         "replaces the time embedder by a table, which is not supported yet)");
+        if (B.adaln.dims[0] != (curve_ ? kCurve : kTimeDim) || B.adaln.dims[1] != kAdaln)
+            throw std::runtime_error(p + (curve_ ? ": the modulation projection is not [96768][8]"
+                                                 : ": the modulation projection is not [96768][2688]"));
     }
     return B;
 }
 
 void H3::load(const safetensors::Files& f)
 {
-    if (f.find("adaln_t_table"))
-        throw std::runtime_error("a pruned checkpoint (adaln_t_table): not supported yet");
+    curve_ = static_cast<bool>(f.find("adaln_t_table"));
     if (!f.find("blocks.0.attn.qkv_proj.weight"))
         throw std::runtime_error("transformer: not MiniMax-H3's weights");
     for (uint32_t i = 0; f.find(std::format("token_refiner.blocks.{}.attn.qkv_proj.weight", i)); ++i)
@@ -167,10 +166,16 @@ void H3::load(const safetensors::Files& f)
     video_in_b_ = upload_f32(f, "video_patch_proj.bias");
     audio_in_ = upload(f, "audio_patch_proj.weight", false);
     audio_in_b_ = upload_f32(f, "audio_patch_proj.bias");
-    t1_ = upload(f, "time_embedder.proj_in.weight", false);
-    t1_b_ = upload_f32(f, "time_embedder.proj_in.bias");
-    t2_ = upload(f, "time_embedder.proj_out.weight", false);
-    t2_b_ = upload_f32(f, "time_embedder.proj_out.bias");
+    if (curve_) {
+        table_ = floats(f, "adaln_t_table");
+        if (table_.size() != uint64_t(kCurvePoints) * kCurve)
+            throw std::runtime_error("adaln_t_table: not [1025][8]");
+    } else {
+        t1_ = upload(f, "time_embedder.proj_in.weight", false);
+        t1_b_ = upload_f32(f, "time_embedder.proj_in.bias");
+        t2_ = upload(f, "time_embedder.proj_out.weight", false);
+        t2_b_ = upload_f32(f, "time_embedder.proj_out.bias");
+    }
     final_adaln_ = upload(f, "final_layer.adaln_proj.linear.weight", true);
     final_adaln_b_ = upload_f32(f, "final_layer.adaln_proj.linear.bias");
     final_norm_ = upload_f32(f, "final_layer.norm.weight");
@@ -179,8 +184,10 @@ void H3::load(const safetensors::Files& f)
     audio_out_ = upload_padded(f, "final_layer.audio_out.weight", kOutRows);
     audio_out_b_ = upload_f32(f, "final_layer.audio_out.bias");
     if (cond_.dims[0] != kText || cond_.dims[1] != kDim || video_in_.dims[0] != kVideoPatch ||
-        audio_in_.dims[0] != kAudioChannels || t1_.dims[0] != kTimeFreq || t1_.dims[1] != kDim ||
-        t2_.dims[0] != kDim || t2_.dims[1] != kTimeDim || final_adaln_.dims[1] != 2 * kDim ||
+        audio_in_.dims[0] != kAudioChannels ||
+        (!curve_ && (t1_.dims[0] != kTimeFreq || t1_.dims[1] != kDim || t2_.dims[0] != kDim ||
+                     t2_.dims[1] != kTimeDim)) ||
+        final_adaln_.dims[0] != (curve_ ? kCurve : kTimeDim) || final_adaln_.dims[1] != 2 * kDim ||
         video_out_b_.dims[0] != kVideoPatch || audio_out_b_.dims[0] != kAudioChannels)
         throw std::runtime_error("transformer: unexpected shapes");
     drop_scratch("i8_stage");
@@ -189,8 +196,9 @@ void H3::load(const safetensors::Files& f)
                                   std::pair{kInt8Fc2, "fc2"}})
         if (int8_ & flag)
             int8 += (int8.empty() ? "" : ", ") + std::string(n);
-    log::info("MiniMax-H3 transformer: {} blocks, {} refiner blocks, {:.1f} GB{}", blocks_.size(), refiner_.size(),
-              double(dense_bytes_) / 1e9, int8.empty() ? "" : " (int8: " + int8 + ")");
+    log::info("MiniMax-H3 transformer: {} blocks, {} refiner blocks, {:.1f} GB{}{}", blocks_.size(), refiner_.size(),
+              double(dense_bytes_) / 1e9, curve_ ? ", pruned (modulation from the curve table)" : "",
+              int8.empty() ? "" : " (int8: " + int8 + ")");
 }
 
 void H3::block(MTL::ComputeCommandEncoder*& enc, const Block& B, MTL::Buffer* x, uint32_t rows, uint32_t Tg,
@@ -393,16 +401,26 @@ H3::Velocity H3::step(std::span<const float> video, std::span<const float> audio
     MTL::Buffer* off2b = scratch("d_off2", uint64_t(S) * 4);
     std::memcpy(offb->contents(), off.data(), off.size() * 4);
     std::memcpy(off2b->contents(), off2.data(), off2.size() * 4);
-    // The sinusoidal embedding of each timestep (cos half first), unscaled.
+    // The sinusoidal embedding of each timestep (cos half first), unscaled; or, pruned, its 8 curve coordinates
+    // interpolated from the table over [0, 1].
     MTL::Buffer* tp = scratch("d_tp", uint64_t(U) * kTimeFreq * 4);
     auto* tpf = static_cast<float*>(tp->contents());
-    for (uint32_t u = 0; u < U; ++u)
+    for (uint32_t u = 0; u < U; ++u) {
+        if (curve_) {
+            const float pos = std::clamp(ts[u], 0.0f, 1.0f) * float(kCurvePoints - 1);
+            const uint32_t i0 = std::min(uint32_t(pos), uint32_t(kCurvePoints - 2));
+            const float w = pos - float(i0);
+            for (uint32_t j = 0; j < kCurve; ++j)
+                tpf[u * kCurve + j] = (1.0f - w) * table_[i0 * kCurve + j] + w * table_[(i0 + 1) * kCurve + j];
+            continue;
+        }
         for (uint32_t i = 0; i < kTimeFreq / 2; ++i) {
             const float freq = std::exp(-std::log(10000.0f) * float(i) / float(kTimeFreq / 2));
             const float arg = ts[u] * freq;
             tpf[u * kTimeFreq + i] = std::cos(arg);
             tpf[u * kTimeFreq + kTimeFreq / 2 + i] = std::sin(arg);
         }
+    }
     MTL::Buffer* th = scratch("d_th", uint64_t(U) * D * 4);
     MTL::Buffer* temb = scratch("d_temb", uint64_t(U) * kTimeDim * 4);
     MTL::Buffer* mods = scratch("d_mods", uint64_t(nb) * U * kAdaln * 4);
@@ -431,21 +449,33 @@ H3::Velocity H3::step(std::span<const float> video, std::span<const float> audio
     cur_cb_ = cb;
     MTL::ComputeCommandEncoder* enc = encoder(cb, 0, -1);
     // The time embedding of each distinct timestep, and silu of it into every block's modulation projection (its
-    // input rounded to BF16 as the projection takes it) and the final layer's.
-    proj(enc, t1_, tp, 0, th, 0, U);
-    bias(enc, th, t1_b_, D, U);
-    unary(enc, "silu", th, U * D);
-    proj(enc, t2_, th, 0, temb, 0, U);
-    bias(enc, temb, t2_b_, kTimeDim, U);
-    probe(enc, "temb", -1, temb, uint64_t(U) * kTimeDim);
-    unary(enc, "silu", temb, U * kTimeDim);
-    for (uint32_t b = 0; b < nb; ++b) {
-        const uint64_t o = uint64_t(b) * U * kAdaln * 4;
-        proj(enc, blocks_[b].adaln, temb, 0, mods, o, U);
-        bias(enc, mods, blocks_[b].adaln_b, kAdaln, U, o);
+    // input rounded to BF16 as the projection takes it) and the final layer's; pruned, the 8 coordinates straight
+    // into the 8-wide projections, in float.
+    if (curve_) {
+        auto curve = [&](const Tensor& w, const Tensor& b, MTL::Buffer* out, uint64_t out_off, uint32_t n) {
+            const uint32_t a[2] = {n, U};
+            dispatch_at(enc, "curve_mods", {Arg{w.buf, w.off}, Arg{b.buf, b.off}, Arg{tp, 0}, Arg{out, out_off}},
+                        a, sizeof(a), MTL::Size(n, U, 1), MTL::Size(256, 1, 1));
+        };
+        for (uint32_t b = 0; b < nb; ++b)
+            curve(blocks_[b].adaln, blocks_[b].adaln_b, mods, uint64_t(b) * U * kAdaln * 4, kAdaln);
+        curve(final_adaln_, final_adaln_b_, fmods, 0, 2 * D);
+    } else {
+        proj(enc, t1_, tp, 0, th, 0, U);
+        bias(enc, th, t1_b_, D, U);
+        unary(enc, "silu", th, U * D);
+        proj(enc, t2_, th, 0, temb, 0, U);
+        bias(enc, temb, t2_b_, kTimeDim, U);
+        probe(enc, "temb", -1, temb, uint64_t(U) * kTimeDim);
+        unary(enc, "silu", temb, U * kTimeDim);
+        for (uint32_t b = 0; b < nb; ++b) {
+            const uint64_t o = uint64_t(b) * U * kAdaln * 4;
+            proj(enc, blocks_[b].adaln, temb, 0, mods, o, U);
+            bias(enc, mods, blocks_[b].adaln_b, kAdaln, U, o);
+        }
+        proj(enc, final_adaln_, temb, 0, fmods, 0, U);
+        bias(enc, fmods, final_adaln_b_, 2 * D, U);
     }
-    proj(enc, final_adaln_, temb, 0, fmods, 0, U);
-    bias(enc, fmods, final_adaln_b_, 2 * D, U);
     probe(enc, "mod0", -1, mods, uint64_t(U) * kAdaln);
     // The rows: [text | conditioning video | audio | video], the media through their patch projections.
     if (C) {

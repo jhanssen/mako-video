@@ -19,6 +19,7 @@ Measured on an M5 Max (128 GB, 40-core GPU), the FL2VA checkpoint with the light
 | Video decode, 1344x768 x 124 frames (7 clips of 4 x 7 tiles) | 69 s |
 | 1344x768, 124 frames, 8 forwards, end to end | about 18.5 min from the forward times (19 measured with the previous attention; 25.6 before the tiles) |
 | 1344x768 with `--int8 all` (below): forwards | 129 s, then 110 s each (about 16.5 min end to end) |
+| 512x288, 124 frames, 9 steps: H3 Eros Max (pruned, distillation merged, no LoRA) / FL2VA + turbo LoRA | 77 s / 91-104 s end to end, 6.4-7.4 s a forward |
 
 The "was" numbers are from before the dense BF16 GEMM moved to 64 x 128 tiles and the attention to 64 keys a pass,
 then to the cooperative kernel (mako-common, below).

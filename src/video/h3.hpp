@@ -15,7 +15,8 @@ namespace mako::video {
 // conditions | audio | video], each row modulated by the AdaLN parameters of its (timestep, modality); a two-block
 // token refiner on the projected text; one velocity head for the video rows and one for the audio rows. From the
 // original BF16 shards (rows of the fused q / k / v matrices interleaved per head) or a single-file checkpoint of
-// the same names (rows stacked q, k, v).
+// the same names (rows stacked q, k, v), including the pruned ones whose time embedder and modulation projections
+// are folded into an 8-coordinate curve table (adaln_t_table), as the ComfyUI and Civitai files are.
 class H3 final : public models::TransformerRuntime {
 public:
     // Which of the 50 blocks' matrices are kept as int8 rows with a scale each (the GEMM at 1.7x BF16's rate, half
@@ -31,6 +32,7 @@ public:
 
     static constexpr uint32_t kDim = 5376, kHeads = 56, kText = 5120, kVideoPatch = 96, kAudioChannels = 32;
     static constexpr uint32_t kTimeFreq = 256, kTimeDim = 2688, kRot = 96, kRopeFreqs = 16;
+    static constexpr uint32_t kCurve = 8, kCurvePoints = 1025; // a pruned checkpoint's curve table
     static constexpr float kRopeTheta = 10000.0f;
     // Modality tags, which index the AdaLN table with the timestep.
     static constexpr uint32_t kVideoTag = 0, kTextTag = 1, kAudioTag = 2;
@@ -92,6 +94,11 @@ private:
         audio_out_b_;
     bool interleaved_ = false; // the file's q / k / v rows interleaved per head
     uint32_t int8_ = 0;        // the Int8 mask
+    // A pruned checkpoint: the time embedder and the 2688-wide modulation inputs folded into an 8-coordinate curve
+    // c(t), tabulated at 1025 points of t in [0, 1] (adaln_t_table) and read with linear interpolation; the blocks'
+    // and the final layer's modulation projections then take the 8 coordinates (no SiLU).
+    bool curve_ = false;
+    std::vector<float> table_; // [1025][8]
     Layout layout_;
     std::vector<uint32_t> tags_; // a modality tag per row
     uint32_t cond_rows_ = 0, S_ = 0;

@@ -173,3 +173,18 @@ kernel void scale_f32(device const float* x [[buffer(0)]], device float* y [[buf
     if (i < a.n)
         y[i] = a.s * x[i];
 }
+
+// A pruned checkpoint's modulation: out[u][o] = b[o] + sum_j w[o][j] c[u][j] over 8 curve coordinates a timestep,
+// in float. Grid (n, U).
+kernel void curve_mods(device const bfloat* w [[buffer(0)]], device const float* b [[buffer(1)]],
+                       device const float* c [[buffer(2)]], device float* out [[buffer(3)]],
+                       constant uint2& a [[buffer(4)]], uint2 gid [[thread_position_in_grid]])
+{
+    const uint o = gid.x, u = gid.y;
+    if (o >= a.x || u >= a.y)
+        return;
+    float s = b[o];
+    for (uint j = 0; j < 8; ++j)
+        s += float(w[uint64_t(o) * 8 + j]) * c[u * 8 + j];
+    out[uint64_t(u) * a.x + o] = s;
+}

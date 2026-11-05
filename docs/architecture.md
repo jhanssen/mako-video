@@ -51,6 +51,10 @@ yet). Rows at different levels run in one forward.
   first lever when memory is short. With `--int8`, the chosen block matrices (q / k / v, out, fc1, fc2) are quantized
   at load to int8 rows with a scale each (all four: 66 -> 47 GB), the activations quantized per row before each
   projection, and the int8 GEMM runs 1.7x faster; LoRAs merge into the int8 rows by requantizing them.
+  Pruned checkpoints (`adaln_t_table` [1025][8]) have no time embedder: the 2688-wide modulation inputs are folded
+  into an 8-coordinate curve c(t), tabulated over t in [0, 1] and read with linear interpolation at t * 1024, and the
+  projections are [96768][8] (final layer [10752][8]) applied without SiLU, in float (`curve_mods`); the rest of
+  the model is unchanged. The mapping was checked against the full model (tools/check_pruned_curve.py: 2e-4).
 - 50 blocks: RMS norm with weight times (1 + scale) plus shift, per row; q / k / v in one GEMM (the shards store the
   fused matrix with each head's rows interleaved, `upload_qkv` stacks them q, k, v so LoRAs land on contiguous rows),
   RMS norms per head, rotary positions, full bidirectional flash attention over 56 heads of 128
