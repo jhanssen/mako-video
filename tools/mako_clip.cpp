@@ -1,8 +1,12 @@
 // A media file's first seconds (its frames and soundtrack as AVFoundation decodes them) written as an MP4 at the
-// source frame rate: a way to cut a reference clip, and to see what the reader makes of a file.
+// source frame rate: a way to cut a reference clip, and to see what the reader makes of a file. With --frame, one
+// frame of it as a PNG instead.
 //   mako_clip <in> <out.mp4> [seconds]
+//   mako_clip <in> --frame N <out.png>
 #include "video/media.hpp"
 #include "video/mp4.hpp"
+
+#include <span>
 
 #include <cmath>
 #include <print>
@@ -16,6 +20,20 @@ int main(int argc, char** argv)
         return 2;
     }
     try {
+        if (std::string(argv[2]) == "--frame") {
+            if (argc < 5) {
+                std::println(stderr, "mako_clip <in> --frame N <out.png>");
+                return 2;
+            }
+            const uint32_t n = uint32_t(std::stoul(argv[3]));
+            auto m = mako::video::read_media(argv[1], true, false, 0);
+            if (n >= m.frames)
+                throw std::runtime_error(std::format("frame {} of {}", n, m.frames));
+            const uint64_t frame = uint64_t(m.width) * m.height * 3;
+            mako::video::write_png(argv[4], m.width, m.height, std::span(m.rgb).subspan(frame * n, frame));
+            std::println("{}: frame {} of {} ({}x{}) to {}", argv[1], n, m.frames, m.width, m.height, argv[4]);
+            return 0;
+        }
         const double seconds = argc > 3 ? std::stod(argv[3]) : 0.0;
         auto m = mako::video::read_media(argv[1], true, true, seconds);
         if (!m.frames)
