@@ -266,7 +266,7 @@ void H3::block(MTL::ComputeCommandEncoder*& enc, const Block& B, MTL::Buffer* x,
     }
     if (sparse) {
         MTL::Buffer *sel = nullptr, *nsel = nullptr;
-        cube_select(enc, qh, kh, kHeads, ak_pad, cubes_.n, cubes_.cnt, cubes_.topk, sel, nsel);
+        cube_select(enc, qh, kh, kHeads, aq_pad, ak_pad, cubes_.n, cubes_.cnt, cubes_.topk, sel, nsel);
         attention_sparse(enc, qh, kh, vh, att, arows, aq_pad, arows, ak_pad, kHeads, kHeads, kHeads * 128, cubes_.n,
                          cubes_.topk, cubes_.dense0, cubes_.dense1, sel, nsel, cubes_.valid, map);
     } else {
