@@ -28,6 +28,14 @@ public:
     // The transformer's directory (its shards and config.json) or a single file; int8: the Int8 mask.
     H3(const std::string& path, mtl::Context& ctx, gpu::Telemetry telemetry = gpu::Telemetry::off, uint32_t int8 = 0);
 
+    // Block-sparse attention over the generated video rows (Video Sparse Attention's training-free form): the rows
+    // in 64-row cubes of 4 latent frames x 4 x 4 patches, each cube's queries attending the share `ratio` of the
+    // cubes a coarse pass over the cubes' mean q and k picks per head (at least one), and the text, conditioning and
+    // audio rows; those rows' queries attend everything. 0: dense attention. Takes effect at the next begin().
+    void set_sparse(float ratio) { sparse_ = ratio; }
+    float sparse() const { return sparse_; }
+    static constexpr uint32_t kCube = 4; // latent frames, patch rows and patch columns of a cube
+
     const char* name() const override { return "MiniMax-H3"; }
 
     static constexpr uint32_t kDim = 5376, kHeads = 56, kText = 5120, kVideoPatch = 96, kAudioChannels = 32;
@@ -102,6 +110,13 @@ private:
     Layout layout_;
     std::vector<uint32_t> tags_; // a modality tag per row
     uint32_t cond_rows_ = 0, S_ = 0;
+    // Sparse attention: the attention's own row order [video cubes (padded) | text | conditions | audio], as a map
+    // from its rows to the model's (-1: a padding row), each cube's valid rows, the dense rows' range.
+    float sparse_ = 0.0f;
+    struct Cubes {
+        uint32_t n = 0, rows = 0, topk = 0, dense0 = 0, dense1 = 0; // cubes; rows in the attention's order
+        MTL::Buffer *map = nullptr, *valid = nullptr, *cnt = nullptr;
+    } cubes_;
 };
 
 } // namespace mako::video

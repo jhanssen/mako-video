@@ -1,6 +1,7 @@
 // MiniMax-H3 against the Diffusers implementation's tensors (tools/dump_h3_ref.py: the text encoder in fp32, the
 // transformer with its BF16 weights computed in fp32, 256x256, 124 frames, 2 steps); an optional fourth argument
-// is the transformer's int8 matrices (none, all, or some of qkv, out, fc1, fc2) to see what quantization costs:
+// is the transformer's int8 matrices (none, all, or some of qkv, out, fc1, fc2) to see what quantization costs, an
+// optional fifth the sparse attention's share of cubes (1 selects every cube and must match the dense model):
 //   tokens    the prompt's and other strings' token ids
 //   schedule  the two schedules' sigmas and timesteps
 //   text      the text encoder's 50th layer output
@@ -133,6 +134,8 @@ int main(int argc, char** argv)
         }
         opts.int8 = *m;
     }
+    if (argc > 5) // the sparse attention's share of cubes (1: every cube, which must give the dense result)
+        opts.sparse = std::stof(argv[5]);
     Engine engine(model.string(), ctx, opts);
 
     if (mode == "tokens") {

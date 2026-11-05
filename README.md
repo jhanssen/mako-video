@@ -62,6 +62,12 @@ Qwen3-VL vision tower into the prompt (a `<Picture i>: ` label and a vision bloc
 video VAE's encoder into the sequence as conditioning rows held at t = 0.999. The lightx2v turbo LoRA above is the
 fl2v one and serves both.
 
+`--sparse RATIO` turns on block-sparse attention over the video rows: they are grouped into 4x4x4 cubes of latent
+frames and patches, and each cube's queries attend only the share RATIO of the cubes that a coarse pass over the
+cubes' mean queries and keys ranks highest for that head (plus the text, keyframe and audio rows). 0.1 is the setting
+the H3 Eros Max merge was tuned for; it is an approximation of the model's dense attention, so expect some change in
+detail. Default 0, dense.
+
 `--transformer` also takes a single-file checkpoint, including the pruned ones (ComfyUI's `*_pruned_*` files and
 Civitai merges such as H3 Eros Max: 40 GB, the time embedder folded into an `adaln_t_table`), with the text encoder
 and VAEs from the model directory. A merge with a few-step distillation in it runs without a LoRA:

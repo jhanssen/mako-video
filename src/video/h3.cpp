@@ -205,11 +205,12 @@ void H3::block(MTL::ComputeCommandEncoder*& enc, const Block& B, MTL::Buffer* x,
                MTL::Buffer* mods, uint64_t mods_off, MTL::Buffer* off, MTL::Buffer* cs)
 {
     const uint32_t D = kDim, q_pad = round_up(rows, kAttnRows), k_pad = round_up(rows, 128);
+    const uint32_t tile_rows = cs && cubes_.n ? round_up(cubes_.rows, 128) : k_pad;
     MTL::Buffer* xn = scratch("d_xn", uint64_t(Tg) * D * 4);
     MTL::Buffer* qkv = scratch("d_qkv", uint64_t(Tg) * kQkv * 4);
-    MTL::Buffer* qh = scratch("d_qh", uint64_t(kHeads) * q_pad * 128 * 2);
-    MTL::Buffer* kh = scratch("d_kh", uint64_t(kHeads) * k_pad * 128 * 2);
-    MTL::Buffer* vh = scratch("d_vh", uint64_t(kHeads) * k_pad * 128 * 2);
+    MTL::Buffer* qh = scratch("d_qh", uint64_t(kHeads) * tile_rows * 128 * 2);
+    MTL::Buffer* kh = scratch("d_kh", uint64_t(kHeads) * tile_rows * 128 * 2);
+    MTL::Buffer* vh = scratch("d_vh", uint64_t(kHeads) * tile_rows * 128 * 2);
     MTL::Buffer* att = scratch("d_att", uint64_t(Tg) * kHeads * 128 * 4);
     MTL::Buffer* y = scratch("d_y", uint64_t(Tg) * D * 4);
     MTL::Buffer* gu = scratch("d_gu", uint64_t(Tg) * 2 * kFfn * 4);
@@ -248,17 +249,29 @@ void H3::block(MTL::ComputeCommandEncoder*& enc, const Block& B, MTL::Buffer* x,
     };
     norm_mod(B.norm1, 0, 1);
     proj(enc, B.qkv, xn, 0, qkv, 0, Tg);
-    // Heads of 128 with their RMS norms, the first 96 values rotated (the refiner: no rotation).
-    heads_partial(enc, qkv, kQkv, 0, 128, 128, cs ? kRot : 0, kHeads, rows, q_pad, cs, &B.norm_q, kEps, qh);
-    heads_partial(enc, qkv, kQkv, kHeads * 128, 128, 128, cs ? kRot : 0, kHeads, rows, k_pad, cs, &B.norm_k, kEps,
-                  kh);
-    heads_partial(enc, qkv, kQkv, 2 * kHeads * 128, 128, 128, 0, kHeads, rows, k_pad, cs, nullptr, 0.0f, vh);
-    if (k_pad > rows) {
-        const uint32_t c[4] = {128, k_pad, rows, 0};
+    // Heads of 128 with their RMS norms, the first 96 values rotated (the refiner: no rotation). With sparse
+    // attention the tiles take the cubes' row order through the map, and the output comes back in the model's.
+    const bool sparse = cs && cubes_.n;
+    const uint32_t arows = sparse ? cubes_.rows : rows;
+    const uint32_t aq_pad = round_up(arows, kAttnRows), ak_pad = round_up(arows, 128);
+    MTL::Buffer* map = sparse ? cubes_.map : nullptr;
+    heads_partial(enc, qkv, kQkv, 0, 128, 128, cs ? kRot : 0, kHeads, arows, aq_pad, cs, &B.norm_q, kEps, qh, map);
+    heads_partial(enc, qkv, kQkv, kHeads * 128, 128, 128, cs ? kRot : 0, kHeads, arows, ak_pad, cs, &B.norm_k, kEps,
+                  kh, map);
+    heads_partial(enc, qkv, kQkv, 2 * kHeads * 128, 128, 128, 0, kHeads, arows, ak_pad, cs, nullptr, 0.0f, vh, map);
+    if (ak_pad > arows) {
+        const uint32_t c[4] = {128, ak_pad, arows, 0};
         for (MTL::Buffer* b : {kh, vh})
-            dispatch(enc, "heads_clear", {b}, c, sizeof(c), MTL::Size(128, k_pad - rows, kHeads), MTL::Size(128, 1, 1));
+            dispatch(enc, "heads_clear", {b}, c, sizeof(c), MTL::Size(128, ak_pad - arows, kHeads), MTL::Size(128, 1, 1));
     }
-    attention(enc, qh, kh, vh, att, rows, q_pad, rows, k_pad, kHeads, kHeads, 0, 0);
+    if (sparse) {
+        MTL::Buffer *sel = nullptr, *nsel = nullptr;
+        cube_select(enc, qh, kh, kHeads, ak_pad, cubes_.n, cubes_.cnt, cubes_.topk, sel, nsel);
+        attention_sparse(enc, qh, kh, vh, att, arows, aq_pad, arows, ak_pad, kHeads, kHeads, kHeads * 128, cubes_.n,
+                         cubes_.topk, cubes_.dense0, cubes_.dense1, sel, nsel, cubes_.valid, map);
+    } else {
+        attention(enc, qh, kh, vh, att, rows, q_pad, rows, k_pad, kHeads, kHeads, 0, 0);
+    }
     proj(enc, B.o, att, 0, y, 0, Tg);
     gated(2);
     norm_mod(B.norm2, 3, 4);
@@ -354,6 +367,43 @@ void H3::begin(std::span<const float> text, const Layout& l)
                 p[2] = grid(l.w, pw, x);
             }
         t += spans[f];
+    }
+    // The sparse attention's cubes: the generated video rows in 4 x 4 x 4 cubes of (frame, patch row, patch column),
+    // the grid padded to multiples of 4 with rows that are no token, then the text, conditioning and audio rows.
+    cubes_ = {};
+    if (sparse_ > 0.0f) {
+        const uint32_t fc = (l.frames + kCube - 1) / kCube, yc = (ph + kCube - 1) / kCube, xc = (pw + kCube - 1) / kCube;
+        const uint32_t n = fc * yc * xc, vrows = n * 64, dense = T + cond_rows_ + A;
+        if (n > 4096)
+            throw std::runtime_error("sparse attention: more than 4096 cubes");
+        cubes_.n = n;
+        cubes_.rows = vrows + dense;
+        cubes_.topk = std::max<uint32_t>(1, uint32_t(std::ceil(double(sparse_) * n)));
+        cubes_.dense0 = vrows;
+        cubes_.dense1 = vrows + dense;
+        const uint32_t q_pad = round_up(cubes_.rows, kAttnRows), k_pad = round_up(cubes_.rows, 128);
+        cubes_.map = scratch("k_map", uint64_t(q_pad) * 4);
+        cubes_.valid = scratch("k_valid", k_pad);
+        cubes_.cnt = scratch("k_cnt", uint64_t(n) * 4);
+        auto* map = static_cast<int32_t*>(cubes_.map->contents());
+        auto* valid = static_cast<uint8_t*>(cubes_.valid->contents());
+        auto* cnt = static_cast<uint32_t*>(cubes_.cnt->contents());
+        std::fill_n(map, q_pad, -1);
+        std::fill_n(valid, k_pad, uint8_t(0));
+        std::fill_n(cnt, n, 0u);
+        for (uint32_t f = 0; f < l.frames; ++f)
+            for (uint32_t y = 0; y < ph; ++y)
+                for (uint32_t x = 0; x < pw; ++x) {
+                    const uint32_t cube = ((f / kCube) * yc + y / kCube) * xc + x / kCube;
+                    const uint32_t r = cube * 64 + ((f % kCube) * kCube + y % kCube) * kCube + x % kCube;
+                    map[r] = int32_t(T + cond_rows_ + A + f * rpf + y * pw + x);
+                    valid[r] = 1;
+                    ++cnt[cube];
+                }
+        for (uint32_t r = 0; r < dense; ++r) {
+            map[vrows + r] = int32_t(r);
+            valid[vrows + r] = 1;
+        }
     }
     MTL::Buffer* cs = scratch("k_cs", uint64_t(S) * (kRot / 2) * 8);
     auto* c = static_cast<float*>(cs->contents());

@@ -6,6 +6,9 @@ foreach(m tokens schedule text dit latents vae audio encode vision resize fl2va 
     add_test(NAME h3_${m} COMMAND h3_ref_test "${MAKO_H3}" "${MAKO_H3_REF}" ${m})
     set_tests_properties(h3_${m} PROPERTIES LABELS video SKIP_RETURN_CODE 77)
 endforeach()
+# Sparse attention with every cube selected: the dense model's velocities through the cube-ordered tiles.
+add_test(NAME h3_dit_sparse_all COMMAND h3_ref_test "${MAKO_H3}" "${MAKO_H3_REF}" dit none 1.0)
+set_tests_properties(h3_dit_sparse_all PROPERTIES LABELS video SKIP_RETURN_CODE 77)
 
 # Image files' orientation tags and the resampler, without a model.
 add_executable(image_test image_test.mm)

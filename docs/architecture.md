@@ -112,9 +112,24 @@ half (`LoraTarget::b_rot`). lightx2v's turbo LoRAs give their alpha (8) as a pla
 Alibaba PAI's Acc-8Step files also carry 32 output heads for a progressive-distillation sampler (`proj_out.weight` of
 [32][96][5376]); that sampler is not built, so they are refused.
 
+## Sparse attention (`--sparse`)
+
+Video Sparse Attention's training-free form (its trained gates are a separate FastVideo file that the merges run
+without). In `begin()` the generated video rows are mapped into 4x4x4 cubes of (latent frame, patch row, patch
+column), the grid padded to multiples of 4 with rows that are no token, followed by the text, keyframe and audio rows:
+an order the attention alone uses (`H3::Cubes`: a map from the attention's rows to the model's, each row's validity,
+each cube's token count). In every block the head tiles are gathered through that map (`heads_partial` with a map,
+padding rows zero), a coarse pass pools each cube's queries and keys to their mean, scores every cube pair per head
+and keeps the top `ratio` share of cubes per query cube (`cube_pool`, `cube_scores`, `cube_topk` in mako-common), and
+`flash_attn_sparse_128` runs the flash attention over a pass list: a cube's selected cubes and the dense rows, or
+everything for a dense row's queries; padding keys are masked, and the outputs are written back to the model's rows.
+With `ratio` 1 every cube is selected and the result is the dense model's (h3_dit_sparse_all checks the velocities
+against the reference). Text-to-video with few video rows gains nothing; the cost that matters is attention's share
+of a 768p forward, 55-60% dense.
+
 ## Not built yet
 
-References (ref2va, the other transformer and its video and audio references), sparse attention, a server.
+References (ref2va, the other transformer and its video and audio references), a server.
 
 ## First and last frame conditioning (fl2va)
 
