@@ -78,7 +78,8 @@ Each simdgroup alone over 16 query rows, scores through a float buffer in thread
 
 Its output accumulator (16 x 128 floats) is in registers; 32 rows a simdgroup spills (30-36 ms at 4 k, measured for
 the image models), and 128 keys a pass with 4 simdgroups needs more threadgroup memory than the 32 KB there is for
-the scores. matmul2d on 16-row tiles runs at 49 TFLOP/s against 64 on 32 or 64-row ones (`bench/mm_rate_bench`).
+the scores. matmul2d runs 16 x 64 tiles at the 60-65 TFLOP/s of 32 and 64-row ones once the clocks are up (the
+first kernel of a run measures 49-56), 16 x 128 tiles at 39 (`bench/mm_rate_bench`).
 
 The kernels tried next (mako-common `bench/attn_ct.metal`, `xp_flash_attn_...`) keep the scores in the matmul's
 cooperative tensor and do the softmax there, so only P (half) goes through threadgroup memory:
@@ -94,10 +95,23 @@ cooperative tensor and do the softmax there, so only P (half) goes through threa
 | `flash_attn_coop` reading key block 0 every pass (compute only) | 207 ms, 51.7 | | 928 ms, 44.6 |
 | `flash_attn_coop` without the maximum exchange (wrong, timing only) | 303 ms | | 1287 ms |
 
-The cooperative kernel's Q K^T and P V are one matmul2d each over the threadgroup's four simdgroups, so they run on
-64-row tiles; a 64 x N result is a 2 x 2 grid of 32 x N/2 blocks over the simdgroups, so a row's scores sit in two
+The cooperative kernel's Q K^T and P V are one matmul2d each over the threadgroup's four simdgroups, so each key
+and value row is read by two simdgroups instead of four and there is no score buffer; a 64 x N result is a 2 x 2
+grid of 32 x N/2 blocks over the simdgroups, so a row's scores sit in two
 of them and its maximum is exchanged through threadgroup memory once a pass (two barriers a pass with P
 double-buffered). The exchange costs nothing measurable; what separates 302 ms from the compute-only 207 is the
 key and value streaming (each row read by two simdgroups a threadgroup, 302 threadgroups a head), and staging the
 tiles in threadgroup memory recovers part of it at 19 k rows but loses at 38 k. 64-wide heads (32 heads at 1797
 keys, the image models' text encoders): 2.2-2.3 ms against 2.3-3.0 for 16 x 32 (noise-level at that size).
+
+### matmul2d's int8 rate (`bench/mm_rate_bench`, 128-deep products on 64 x 128 and 128 x 128 tiles)
+
+| Operands, accumulator | TFLOP/s |
+| --- | ---: |
+| bfloat or half, float | 65 |
+| int8, int32 | 127-130 |
+
+Twice the BF16 rate at every tile tried, so int8 GEMMs with per-row dynamic activation scales (the approach of
+antirez/h3.c, which reports 36.3 -> 19.3 s for a 19-forward 512x512 denoise from int8 MLP and QKV against BF16
+MPSGraph) would take the GEMMs' 32-38 s of a 768p forward towards 17-20 s, at a quantization cost not measured here.
+Not built.
