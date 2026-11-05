@@ -92,8 +92,12 @@ and VAEs from the model directory. A merge with a few-step distillation in it ru
 
 ```sh
 ./build/mako_video ~/models/minimax-h3/FL2VA "..." --transformer ~/models/minimax-h3/eros-max/h3ErosMax_beta7_bf16.safetensors \
-    --steps 9 -o out.mp4
+    --steps 7 -o out.mp4
 ```
+
+(H3 Eros Max has the FastH3 adapter merged in, so it is its own few-step model; its author runs 6 steps, which is 7
+schedule points here: on the two-shot fox prompt at 512x288, 7 points gave the same frames as 9 by eye in 78 s
+instead of 104.)
 
 A LoRA made for the full model applies to a pruned one except for its modulation keys (the pruned projections take 8
 coordinates, not 2688), which are skipped and counted in the log; most LoRAs adapt only the attention and MLP
