@@ -224,6 +224,101 @@ int main(int argc, char** argv)
             compare("video velocity", vel.video, read_f32(ref / std::format("step{}_pred_video.f32", i)), H3::kVideoPatch, 2e-2);
             compare("audio velocity", vel.audio, read_f32(ref / std::format("step{}_pred_audio.f32", i)), H3::kAudioChannels, 2e-2);
         }
+    } else if (mode == "resize") {
+        // The keyframes onto the canvas: the first stretched, the second cover-cropped, against PIL's Lanczos.
+        for (int i = 0; i < 2; ++i) {
+            const auto src = read_file(ref / (i == 0 ? "fl_first.u8" : "fl_last.u8"));
+            const auto& sz = m[i == 0 ? "fl_first_size" : "fl_last_size"].get_array();
+            mako::video::Image img{uint32_t(sz[0].get_number()), uint32_t(sz[1].get_number()),
+                              std::vector<uint8_t>(src.begin(), src.end())};
+            const auto got = Engine::prepare_keyframe(img, size, size, i == 0);
+            const auto want = read_file(ref / std::format("fl_keyframe{}.u8", i));
+            check(got.rgb.size() == want.size(), std::format("keyframe {}: {} bytes", i, got.rgb.size()));
+            double sum = 0;
+            int worst = 0;
+            for (size_t k = 0; k < want.size() && k < got.rgb.size(); ++k) {
+                const int d = std::abs(int(got.rgb[k]) - int(uint8_t(want[k])));
+                sum += d;
+                worst = std::max(worst, d);
+            }
+            const double mean = sum / double(want.size());
+            check(mean < 0.5 && worst <= 8, std::format("keyframe {} ({}): mean |diff| {:.3f} of 255, worst {}", i,
+                                                         i == 0 ? "stretched" : "cover-cropped", mean, worst));
+        }
+    } else if (mode == "fl2va" || mode == "fl2va_latents") {
+        // The transformer with two keyframes' rows in the sequence: from the reference's text embeddings, tags and
+        // per-step rows (fl2va), or the engine end to end from the keyframes (fl2va_latents).
+        const uint32_t lat_f = uint32_t(m["latent_frames"].get_number()), lat_h = uint32_t(m["latent_height"].get_number()),
+                       lat_w = uint32_t(m["latent_width"].get_number()), n_audio = uint32_t(m["num_audio_latents"].get_number());
+        const uint32_t C = uint32_t(m["fl_condition_rows"].get_number());
+        const auto vt = floats_of(m["video_timesteps"]), at = floats_of(m["audio_timesteps"]);
+        if (mode == "fl2va_latents") {
+            Engine::Request r;
+            r.prompt = prompt;
+            r.width = r.height = size;
+            r.frames = frames;
+            r.steps = steps;
+            const auto nv = read_f32(ref / "fl_noise_video_rows.f32"), na = read_f32(ref / "fl_noise_audio_rows.f32");
+            r.noise_video = nv;
+            r.noise_audio = na;
+            std::vector<std::vector<float>> kn;
+            auto hwc = [&](const std::vector<float>& chw) { // [24][h][w] -> [h][w][24]
+                std::vector<float> o(chw.size());
+                for (uint32_t c = 0; c < 24; ++c)
+                    for (uint32_t y = 0; y < lat_h; ++y)
+                        for (uint32_t x = 0; x < lat_w; ++x)
+                            o[(uint64_t(y) * lat_w + x) * 24 + c] = chw[(uint64_t(c) * lat_h + y) * lat_w + x];
+                return o;
+            };
+            for (int i = 0; i < 2; ++i) {
+                const auto rgb = read_file(ref / std::format("fl_keyframe{}.u8", i));
+                mako::video::Image img{size, size, std::vector<uint8_t>(rgb.begin(), rgb.end())};
+                (i == 0 ? r.first : r.last) = std::move(img);
+                kn.push_back(hwc(read_f32(ref / std::format("fl_cond_noise{}.f32", i))));
+            }
+            for (const auto& k : kn)
+                r.keyframe_noise.emplace_back(k);
+            const auto L = engine.denoise(r);
+            check(L.condition_rows == C, std::format("{} conditioning rows", L.condition_rows));
+            const auto want = read_f32(ref / "fl_final_video_rows.f32");
+            compare("keyframe rows", std::span(L.video).first(uint64_t(C) * H3::kVideoPatch),
+                    std::vector<float>(want.begin(), want.begin() + uint64_t(C) * H3::kVideoPatch), H3::kVideoPatch, 1e-2);
+            compare("final video rows", std::span(L.video).subspan(uint64_t(C) * H3::kVideoPatch),
+                    std::vector<float>(want.begin() + uint64_t(C) * H3::kVideoPatch, want.end()), H3::kVideoPatch, 0.06);
+            compare("final audio rows", L.audio, read_f32(ref / "fl_final_audio_rows.f32"), H3::kAudioChannels, 0.03);
+            return failures ? 1 : 0;
+        }
+        const auto text = read_f32(ref / "fl_text_embeds.f32");
+        const uint32_t T = uint32_t(text.size() / H3::kText);
+        H3::Layout layout{.text = T, .frames = lat_f, .h = lat_h, .w = lat_w, .audio = n_audio, .cond_frames = 2,
+                          .cond_last = {0, 1}};
+        for (const auto& v : m["fl_tags"].get_array())
+            layout.text_tags.push_back(uint8_t(v.get_number()));
+        const uint32_t S = layout.rows();
+        check(S == uint32_t(m["fl_seq_len"].get_number()) && layout.cond_rows() == C, std::format("{} rows, {} conditioning", S, C));
+        H3& dit = engine.transformer();
+        std::map<std::string, std::vector<float>> probes;
+        dit.set_probe([&](const std::string& name, int layer, const float* data, size_t n) {
+            probes[layer < 0 ? name : std::format("{}{}", name, layer)] = std::vector<float>(data, data + n);
+        });
+        dit.begin(text, layout);
+        compare("text after the refiner", probes["txt"], read_f32(ref / "fl_s0_txt.f32"), H3::kDim, 5e-3);
+        for (uint32_t i = 0; i < vt.size(); ++i) {
+            probes.clear();
+            const auto vin = read_f32(ref / std::format("fl_step{}_video_rows.f32", i));
+            const auto ain = read_f32(ref / std::format("fl_step{}_audio_rows.f32", i));
+            const auto vel = dit.step(vin, ain, vt[i], at[i]);
+            std::println(" step {} (t video {}, audio {})", i, vt[i], at[i]);
+            compare("packed input", probes["x0"], read_f32(ref / std::format("fl_s{}_x0.f32", i)), H3::kDim, 5e-3);
+            for (int b : {0, 1, 24, 49})
+                compare(std::format("block {}", b), probes[std::format("block{}", b)],
+                        read_f32(ref / std::format("fl_s{}_block{}.f32", i, b)), H3::kDim, b < 40 ? 1e-2 : 4e-2);
+            compare("final norm", probes["norm_out"], read_f32(ref / std::format("fl_s{}_norm_out.f32", i)), H3::kDim, 6e-2);
+            const auto pv = read_f32(ref / std::format("fl_step{}_pred_video.f32", i));
+            compare("video velocity (generated rows)", std::span(vel.video).subspan(uint64_t(C) * H3::kVideoPatch),
+                    std::vector<float>(pv.begin() + uint64_t(C) * H3::kVideoPatch, pv.end()), H3::kVideoPatch, 2e-2);
+            compare("audio velocity", vel.audio, read_f32(ref / std::format("fl_step{}_pred_audio.f32", i)), H3::kAudioChannels, 2e-2);
+        }
     } else if (mode == "vision") {
         // The keyframe presentation: the vision tower's merged tokens and DeepStack features for the first keyframe
         // against the fp32 reference, then the text encoder's 50th layer over the whole presentation (labels, vision

@@ -55,6 +55,13 @@ matrices kept as int8: `all`, or some of `qkv,out,fc1,fc2`; default none: see do
 `--keep-text-encoder`, `--text-encoder DIR`, `--transformer PATH`, `--llm URL`, `--llm-api-key KEY`. Each also from
 `MAKO_VIDEO_<OPTION>` and presets (`--preset NAME`).
 
+`--image FILE` conditions on a first frame and `--last-image FILE` on a last one (fl2va): the canvas takes the first
+keyframe's aspect ratio (short edge 768, at most 768 x 1344) unless `--width` / `--height` say otherwise; the first
+keyframe is stretched onto it, the last scaled to cover it and cropped at the centre. Each keyframe goes through the
+Qwen3-VL vision tower into the prompt (a `<Picture i>: ` label and a vision block ahead of the text) and through the
+video VAE's encoder into the sequence as conditioning rows held at t = 0.999. The lightx2v turbo LoRA above is the
+fl2v one and serves both.
+
 `--transformer` also takes a single-file checkpoint, including the pruned ones (ComfyUI's `*_pruned_*` files and
 Civitai merges such as H3 Eros Max: 40 GB, the time embedder folded into an `adaln_t_table`), with the text encoder
 and VAEs from the model directory. A merge with a few-step distillation in it runs without a LoRA:

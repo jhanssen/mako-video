@@ -114,6 +114,32 @@ Alibaba PAI's Acc-8Step files also carry 32 output heads for a progressive-disti
 
 ## Not built yet
 
-Keyframe conditioning (fl2va: the Qwen3-VL vision tower for the keyframe's tokens, the causal 3D VAE encoder for its
-latents, the conditioning rows), references (ref2va, the other transformer), the pruned single-file checkpoints
-(`adaln_t_table` with rank-8 AdaLN projections: Comfy-Org's and Civitai fine-tunes), sparse attention, a server.
+References (ref2va, the other transformer and its video and audio references), sparse attention, a server.
+
+## First and last frame conditioning (fl2va)
+
+A keyframe is put onto the canvas as the released pipeline does it (`Engine::prepare_keyframe`: the first keyframe
+stretched with a 3-lobe Lanczos filter, PIL's arithmetic, each pass rounded to 8 bits; the last scaled to cover the
+canvas and cropped at the centre), then used twice:
+
+- In the prompt. The presentation is, per keyframe, the tokens of `"<Picture i>: "` and a vision block
+  (`<|vision_start|>`, one `<|image_pad|>` per merged token, `<|vision_end|>`), then the prompt verbatim. The
+  keyframe runs through Qwen3-VL's vision tower (mako-common `models::QwenVision`: 16x16 patches in 2x2 merge-block
+  order, the learned 48x48 position grid resampled bilinearly, 27 blocks with 2D axial rope over 72-wide heads, the
+  merger to 5120) and its merged tokens replace the pad tokens' embeddings in the text encoder, whose rotary
+  positions become Qwen3-VL's interleaved three-axis ones for them; its three DeepStack features are added to the
+  hidden states after the first three layers. The block's rows (start, pads, end) are tagged as video for the
+  transformer's modulation, the labels and the prompt as text.
+- In the sequence. The keyframe goes through the video VAE's causal 3D CNN encoder on the single frame (reflect
+  padding, the convolutions' last time taps; 256-pixel tiles blended in latent space), the posterior is sampled
+  under seed 42 with torch's CPU generator reproduced (so the anchor is the released pipeline's, to about 1e-6),
+  rounded to fp16 and normalized, mixed with the request's noise at t = 0.999, and packed into rows ahead of the
+  generated video rows (`Layout::cond_frames`, each anchored at the first or the last generated frame's rotary time).
+  Those rows keep their timestep 0.999 every step and are never updated; the decoder gets the generated rows only.
+
+Checked against the reference dump's fl2va stage (two synthetic keyframes, 256x256, 2 steps): the resize is
+pixel-exact against PIL (worst 1 of 255), the VAE encoder's posterior to 7e-4 to 3e-3, the vision tower's merged
+tokens to 1.4e-3, the text embeddings with the keyframes to 7.6e-4, the transformer's velocities with the
+conditioning rows to 1e-2, and the engine end to end to 5e-2 on the final video rows (the same regime as text to
+video's 4.6e-2).
+

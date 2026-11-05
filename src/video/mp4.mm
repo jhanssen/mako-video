@@ -1,5 +1,7 @@
 #include "video/mp4.hpp"
 
+#include "video/image.hpp"
+
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
@@ -270,6 +272,41 @@ void write_png(const std::string& path, uint32_t width, uint32_t height, std::sp
     CGImageRelease(image);
     if (!ok)
         throw std::runtime_error("png: cannot write " + path);
+}
+
+Image read_image(const std::string& path)
+{
+    NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path.c_str()]];
+    CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, nullptr);
+    if (!src)
+        throw std::runtime_error("cannot open the image " + path);
+    CGImageRef image = CGImageSourceCreateImageAtIndex(src, 0, nullptr);
+    CFRelease(src);
+    if (!image)
+        throw std::runtime_error(path + " is not an image ImageIO reads");
+    Image out;
+    out.width = uint32_t(CGImageGetWidth(image));
+    out.height = uint32_t(CGImageGetHeight(image));
+    std::vector<uint8_t> rgba(uint64_t(out.width) * out.height * 4);
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(rgba.data(), out.width, out.height, 8, uint64_t(out.width) * 4, space,
+                                             CGBitmapInfo(kCGImageAlphaPremultipliedLast) | CGBitmapInfo(kCGBitmapByteOrder32Big));
+    if (!ctx) {
+        CGColorSpaceRelease(space);
+        CGImageRelease(image);
+        throw std::runtime_error("cannot decode " + path);
+    }
+    CGContextSetRGBFillColor(ctx, 1, 1, 1, 1); // transparency over white
+    CGContextFillRect(ctx, CGRectMake(0, 0, out.width, out.height));
+    CGContextDrawImage(ctx, CGRectMake(0, 0, out.width, out.height), image);
+    CGContextRelease(ctx);
+    CGColorSpaceRelease(space);
+    CGImageRelease(image);
+    out.rgb.resize(uint64_t(out.width) * out.height * 3);
+    for (uint64_t i = 0; i < uint64_t(out.width) * out.height; ++i)
+        for (int c = 0; c < 3; ++c)
+            out.rgb[i * 3 + c] = rgba[i * 4 + c];
+    return out;
 }
 
 } // namespace mako::video

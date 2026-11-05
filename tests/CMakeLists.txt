@@ -2,7 +2,7 @@
 # MiniMax-H3 against the Diffusers implementation's tensors (MAKO_H3_REF, written by tools/dump_h3_ref.py).
 add_executable(h3_ref_test h3_ref_test.cpp)
 target_link_libraries(h3_ref_test PRIVATE mako_videogen glaze_headers)
-foreach(m tokens schedule text dit latents vae audio encode vision)
+foreach(m tokens schedule text dit latents vae audio encode vision resize fl2va fl2va_latents)
     add_test(NAME h3_${m} COMMAND h3_ref_test "${MAKO_H3}" "${MAKO_H3_REF}" ${m})
     set_tests_properties(h3_${m} PROPERTIES LABELS video SKIP_RETURN_CODE 77)
 endforeach()

@@ -3,7 +3,9 @@
 #include "models/qwen_text.hpp"
 #include "text/tokenizer.hpp"
 #include "video/audio_vae.hpp"
+#include "models/qwen_vision.hpp"
 #include "video/h3.hpp"
+#include "video/image.hpp"
 #include "video/video_vae.hpp"
 
 #include <cstdint>
@@ -65,6 +67,12 @@ public:
         // Instead of the seed's: the video rows' noise [latent frames * (h / 32) * (w / 32)][96] and the audio rows'
         // [2 * audio latents][32].
         std::span<const float> noise_video, noise_audio;
+        // fl2va: the first frame and / or the last, any size (put onto the canvas: the first stretched, the last
+        // cover-cropped). Without width and height the canvas takes the first keyframe's aspect ratio.
+        std::optional<Image> first, last;
+        // Instead of the seed's: the noise mixed into each keyframe's latents ([latent_h][latent_w][24], first then
+        // last).
+        std::vector<std::span<const float>> keyframe_noise;
         float video_shift = kVideoShift, audio_shift = kAudioShift;
         std::function<void(uint32_t step, uint32_t steps)> progress;
     };
@@ -73,8 +81,12 @@ public:
     struct Latents {
         uint32_t width = 0, height = 0, frames = 0; // pixels and frames of the video
         uint32_t latent_frames = 0, latent_h = 0, latent_w = 0, audio_latents = 0;
+        uint32_t condition_rows = 0; // leading video rows that are keyframe conditioning, not decoded
         std::vector<float> video, audio;
     };
+    // A keyframe onto the canvas as the released pipeline puts it: the first stretched (Lanczos), another scaled to
+    // cover the canvas and cropped at the centre.
+    static Image prepare_keyframe(const Image& img, uint32_t width, uint32_t height, bool first);
     Latents denoise(const Request& r);
     // The video rows as voxels [latent frames][latent_h][latent_w][24], the video VAE's input.
     static std::vector<float> voxels(const Latents& l);
@@ -91,15 +103,23 @@ public:
     };
     Result generate(const Request& r);
 
-    // The transformer's text input for a prompt: the conditioner's 50th layer's output, [tokens][5120].
-    std::vector<float> prompt_embeddings(const std::string& prompt);
+    // The transformer's text input for a prompt: the conditioner's 50th layer's output, [tokens][5120]. With
+    // keyframes (on the canvas), the presentation is a "<Picture i>: " label and a vision block per keyframe, then
+    // the prompt; `tags` gets each token's modality (text, or video for a vision block's).
+    std::vector<float> prompt_embeddings(const std::string& prompt, std::span<const Image> keyframes = {},
+                                         std::vector<uint8_t>* tags = nullptr);
     const text::Tokenizer& tokenizer() const { return *tok_; }
     // The parts, each loaded on first use (the text encoder kept with Options::keep_text_encoder).
     H3& transformer();
     models::QwenText& text_encoder();
+    models::QwenVision& vision();
     VideoVae& video_vae();
     AudioVae& audio_vae();
-    void free_text_encoder() { text_.reset(); }
+    void free_text_encoder()
+    {
+        text_.reset();
+        vision_.reset();
+    }
     // A LoRA merged into the transformer's weights, when it loads (the text encoder runs first: both do not fit).
     void add_lora(const Lora& l);
     uint32_t default_steps() const { return 50; }
@@ -110,6 +130,7 @@ private:
     std::string dir_;
     std::optional<text::Tokenizer> tok_;
     std::unique_ptr<models::QwenText> text_;
+    std::unique_ptr<models::QwenVision> vision_;
     std::unique_ptr<H3> dit_;
     std::vector<Lora> loras_; // to merge when the transformer loads
     std::unique_ptr<VideoVae> vae_;

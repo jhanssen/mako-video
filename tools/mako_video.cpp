@@ -1,6 +1,7 @@
 // Text to video with audio with MiniMax-H3 from its original files.
 //   mako_video <model dir> <prompt> [-o out.mp4] [--width N --height N] [--seconds F | --frames N] [--steps N]
-//              [--seed N] [--lora FILE[:SCALE] ...] [--still FILE] [--frames-dir DIR] [--int8 LIST] [--keep-text-encoder]
+//              [--seed N] [--image FILE] [--last-image FILE] [--lora FILE[:SCALE] ...] [--still FILE] [--frames-dir DIR]
+//              [--int8 LIST] [--keep-text-encoder]
 //              [--text-encoder DIR]
 //              [--transformer PATH] [--llm URL] [--llm-api-key KEY]
 // --width / --height: the canvas in multiples of 32 (default the model's 16:9 canvas, 1344x768). --seconds / --frames:
@@ -14,6 +15,7 @@
 #include "memory/borrower.hpp"
 #include "mtl/context.hpp"
 #include "video/engine.hpp"
+#include "video/image.hpp"
 #include "video/mp4.hpp"
 
 #include <Foundation/Foundation.hpp>
@@ -60,7 +62,7 @@ mako::video::Lora parse_lora(const std::string& spec)
 
 int main(int argc, char** argv)
 {
-    std::string llm, llm_key, out = "video.mp4", still, frames_dir, text_encoder, transformer;
+    std::string llm, llm_key, out = "video.mp4", still, frames_dir, text_encoder, transformer, image, last_image;
     mako::gpu::Telemetry telemetry = mako::gpu::Telemetry::off;
     uint32_t width = 0, height = 0, frames = 0, steps = 0;
     double seconds = 0;
@@ -78,6 +80,8 @@ int main(int argc, char** argv)
         .option("--seed", "N", "the noise's seed (default 0)", seed)
         .option("--lora", "FILE[:SCALE]", "add a LoRA merged into the transformer (repeatable)",
                 [&](const std::string& v) { loras.push_back(parse_lora(v)); })
+        .option("--image", "FILE", "the first frame (fl2va): the canvas takes its aspect ratio unless --width / --height", image)
+        .option("--last-image", "FILE", "the last frame (fl2va), cover-cropped onto the canvas", last_image)
         .option("--still", "FILE", "also write the middle frame as a PNG", still)
         .option("--frames-dir", "DIR", "also write every frame as DIR/NNN.png", frames_dir)
         .flag("--keep-text-encoder", "keep the text encoder loaded beside the transformer", keep_text)
@@ -129,6 +133,10 @@ int main(int argc, char** argv)
             r.frames = frames;
         r.steps = steps;
         r.seed = seed;
+        if (!image.empty())
+            r.first = mako::video::read_image(image);
+        if (!last_image.empty())
+            r.last = mako::video::read_image(last_image);
         auto t_step = Clock::now();
         r.progress = [&](uint32_t i, uint32_t total) {
             mako::log::info("step {} of {}: {:.1f} s, thermal {}", i, total, since(t_step), thermal_state());

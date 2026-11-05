@@ -29,7 +29,7 @@ set(S ${CMAKE_CURRENT_SOURCE_DIR}/src)
 mako_add_kernels(video_kernels SOURCES ${S}/kernels/video.metal)
 
 add_library(mako_videogen STATIC ${S}/video/h3.cpp ${S}/video/video_vae.cpp ${S}/video/audio_vae.cpp
-            ${S}/video/engine.cpp ${S}/video/mp4.mm)
+            ${S}/video/engine.cpp ${S}/video/mp4.mm ${S}/video/image.cpp)
 target_include_directories(mako_videogen PUBLIC ${S})
 target_link_libraries(mako_videogen PUBLIC mako_gpu mako_models mako_safetensors mako_text mako_log
                       PRIVATE glaze_headers "-framework AVFoundation" "-framework CoreMedia" "-framework CoreVideo"
