@@ -130,9 +130,21 @@ With `ratio` 1 every cube is selected and the result is the dense model's (h3_di
 against the reference). Text-to-video with few video rows gains nothing; the cost that matters is attention's share
 of a 768p forward, 55-60% dense.
 
-## Not built yet
+## Server
 
-A server (mako-image's residency pattern).
+`mako_video_serve` (src/server) is mako_image_serve's shape with jobs: one `memory::Residency<Engine>` (mako-common's,
+shared with mako-image: a model in memory, replaced when a job wants another or other LoRAs, freed when the LLM asks
+for its memory back) and a worker thread that takes the queue in order, acquires the lease, runs
+`Engine::generate` with a progress callback that updates the job and checks for cancellation, and writes NAME.mp4 and
+NAME.png. Requests carry media as base64 (keyframes and references), written to a temporary file for the readers and
+removed. `VideoModel` reads a models directory: MiniMax-H3's layout, a Ref2VA beside it, a lone transformer file
+lent the first model's encoders and VAEs, or a mako.json.
+
+Memory across jobs: the engine stays, with its VAEs; the text encoder comes and goes with each prompt; the
+transformer stays only when the machine holds it beside the text encoder with room (`Engine::keeps_transformer`:
+1.35 x their files against hw.memsize; `Options::keep_transformer` overrides). On the 137 GB M5 Max both resident
+(115 GB) swap: steps went from 9.5-12 s to 17 s and the decode from 15 to 28 s at 512x288, so there the transformer
+is freed before the prompt and loaded again after it (6 s from the file cache plus the LoRA merge).
 
 ## First and last frame conditioning (fl2va)
 

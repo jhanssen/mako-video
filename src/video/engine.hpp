@@ -23,6 +23,10 @@ struct Options {
     std::string transformer;  // another directory or file of the transformer's weights (default: the model's)
     // Keep the text encoder loaded between generations (49 GB); else it is loaded for each prompt and freed.
     bool keep_text_encoder = false;
+    // Keep the transformer loaded while the text encoder runs for the next prompt (both resident, 66 + 49 GB). Unset:
+    // only when the machine's memory holds both with room (1.35 x their files); else the transformer is freed before
+    // the prompt and loaded again after it (about 15 s with LoRAs merged), which beats swapping.
+    std::optional<bool> keep_transformer;
     gpu::Telemetry telemetry = gpu::Telemetry::off;
     uint32_t int8 = 0; // H3::Int8: the transformer blocks' matrices kept as int8
     float sparse = 0;  // H3::set_sparse: the share of video cubes each cube attends (0: dense attention)
@@ -97,6 +101,9 @@ public:
         std::vector<std::span<const float>> reference_noise;
         float video_shift = kVideoShift, audio_shift = kAudioShift;
         std::function<void(uint32_t step, uint32_t steps)> progress;
+        // Called as the stages begin: encoding the prompt, encoding the references, loading the transformer,
+        // denoising, decoding the video, decoding the audio.
+        std::function<void(const std::string& stage)> stage;
     };
     // The denoised, normalized latents of a request: the video rows (frame-major, then 2x2 patches of the latent
     // frame, each row a patch's [24 channels][2][2] values) and the channel-major audio rows.
@@ -162,6 +169,10 @@ public:
         text_.reset();
         vision_.reset();
     }
+    void free_transformer() { dit_.reset(); }
+    // Whether the transformer stays loaded while a prompt is encoded (Options::keep_transformer, else the machine's
+    // memory decides).
+    bool keeps_transformer();
     // A LoRA merged into the transformer's weights, when it loads (the text encoder runs first: both do not fit).
     void add_lora(const Lora& l);
     uint32_t default_steps() const { return 50; }
@@ -174,7 +185,8 @@ private:
     std::unique_ptr<models::QwenText> text_;
     std::unique_ptr<models::QwenVision> vision_;
     std::unique_ptr<H3> dit_;
-    std::vector<Lora> loras_; // to merge when the transformer loads
+    std::vector<Lora> loras_; // merged whenever the transformer loads
+    std::optional<bool> keeps_transformer_;
     std::unique_ptr<VideoVae> vae_;
     std::unique_ptr<AudioVae> avae_;
     // A vision block (start, the merged tokens' pads, end) appended to a presentation, its rows tagged as video.

@@ -36,8 +36,14 @@ target_link_libraries(mako_videogen PUBLIC mako_gpu mako_models mako_safetensors
                       "-framework Foundation" "-framework ImageIO" "-framework CoreGraphics")
 set_source_files_properties(${S}/video/mp4.mm ${S}/video/media.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 
+add_library(mako_video_server STATIC ${S}/server/video_models.cpp ${S}/server/video_server.cpp)
+target_include_directories(mako_video_server PUBLIC ${S})
+target_link_libraries(mako_video_server PUBLIC mako_videogen mako_memory mako_http PRIVATE glaze_headers httplib_headers)
+
 add_executable(mako_video tools/mako_video.cpp)
 target_link_libraries(mako_video PRIVATE mako_videogen mako_memory mako_app)
+add_executable(mako_video_serve tools/mako_video_serve.cpp)
+target_link_libraries(mako_video_serve PRIVATE mako_video_server mako_app)
 add_executable(mako_clip tools/mako_clip.cpp)
 target_link_libraries(mako_clip PRIVATE mako_videogen)
 

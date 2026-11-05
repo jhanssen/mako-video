@@ -23,3 +23,13 @@ add_executable(geometry_test geometry_test.cpp)
 target_link_libraries(geometry_test PRIVATE mako_videogen)
 add_test(NAME geometry COMMAND geometry_test)
 set_tests_properties(geometry PROPERTIES LABELS cpu)
+
+# The HTTP server's checks, its job queue and errors, without a model (a stand-in model directory).
+add_executable(video_server_test video_server_test.cpp)
+target_link_libraries(video_server_test PRIVATE mako_video_server httplib_headers)
+add_test(NAME video_server COMMAND video_server_test ${CMAKE_CURRENT_BINARY_DIR})
+# Model directories and mako.json, LoRA listing and resolution.
+add_executable(video_models_test video_models_test.cpp)
+target_link_libraries(video_models_test PRIVATE mako_video_server)
+add_test(NAME video_models COMMAND video_models_test ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(video_server video_models PROPERTIES LABELS cpu)

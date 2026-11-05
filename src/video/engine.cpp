@@ -11,6 +11,8 @@
 #include <random>
 #include <stdexcept>
 
+#include <sys/sysctl.h>
+
 namespace mako::video {
 
 namespace {
@@ -116,10 +118,40 @@ H3& Engine::transformer()
 
 void Engine::add_lora(const Lora& l)
 {
+    loras_.push_back(l);
     if (dit_)
         dit_->add_lora(l.path, l.scale, true);
-    else
-        loras_.push_back(l);
+}
+
+bool Engine::keeps_transformer()
+{
+    if (opts_.keep_transformer)
+        return *opts_.keep_transformer;
+    if (keeps_transformer_)
+        return *keeps_transformer_;
+    // The weights' files, the transformer's and the text encoder's, against the machine's memory.
+    auto bytes = [](const std::filesystem::path& p) {
+        uint64_t n = 0;
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(p, ec))
+            return uint64_t(std::filesystem::file_size(p, ec));
+        for (const auto& e : std::filesystem::recursive_directory_iterator(p, ec))
+            if (e.is_regular_file(ec) && e.path().extension() == ".safetensors")
+                n += e.file_size(ec);
+        return n;
+    };
+    const uint64_t t = bytes(opts_.transformer.empty() ? dir_ + "/transformer" : opts_.transformer);
+    const uint64_t te = bytes(opts_.text_encoder.empty() ? dir_ + "/text_encoder" : opts_.text_encoder);
+    uint64_t mem = 0;
+    size_t len = sizeof(mem);
+    if (sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) != 0)
+        mem = 0;
+    keeps_transformer_ = double(mem) >= 1.35 * double(t + te);
+    log::info("the transformer ({:.0f} GB) and the text encoder ({:.0f} GB) {} in this machine's {:.0f} GB: the transformer "
+              "{}",
+              double(t) / 1e9, double(te) / 1e9, *keeps_transformer_ ? "fit together" : "do not fit together with room",
+              double(mem) / 1e9, *keeps_transformer_ ? "stays loaded across prompts" : "is freed for each prompt and loaded again");
+    return *keeps_transformer_;
 }
 
 VideoVae& Engine::video_vae()
@@ -181,6 +213,8 @@ Engine::Result Engine::generate(const Request& r)
     res.frames = l.frames;
     res.rgb.resize(uint64_t(l.frames) * l.height * l.width * 3);
     const auto t0 = Clock::now();
+    if (r.stage)
+        r.stage("decoding the video");
     decode_video(l, [&](uint32_t i, std::span<const float> rgb) {
         if (i >= l.frames)
             throw std::runtime_error("the video VAE decoded more frames than asked for");
@@ -190,6 +224,8 @@ Engine::Result Engine::generate(const Request& r)
     });
     log::info("video decoded in {:.1f} s", seconds_since(t0));
     const auto t1 = Clock::now();
+    if (r.stage)
+        r.stage("decoding the audio");
     res.audio = decode_audio(l);
     log::info("audio decoded in {:.1f} s", seconds_since(t1));
     return res;
@@ -509,6 +545,16 @@ Engine::Latents Engine::denoise(const Request& r)
         }
         refs.push_back(std::move(ref));
     }
+    auto stage = [&](const char* what) {
+        if (r.stage)
+            r.stage(what);
+    };
+    // The transformer makes room for the text encoder unless both fit.
+    if (dit_ && !opts_.keep_text_encoder && !keeps_transformer()) {
+        log::info("transformer freed for the text encoder");
+        dit_.reset();
+    }
+    stage("encoding the prompt");
     std::vector<uint8_t> tags;
     const auto text = refs.empty() ? prompt_embeddings(r.prompt, keyframes, &tags) : reference_embeddings(r.prompt, refs, &tags);
     std::mt19937_64 rng(r.seed);
@@ -544,6 +590,8 @@ Engine::Latents Engine::denoise(const Request& r)
     // in order before the generated rows'), a soundtrack's through the audio VAE's encoder, clean.
     std::vector<H3::Layout::Reference> ref_layout;
     std::vector<float> cond_audio;
+    if (!refs.empty())
+        stage("encoding the references");
     if (!r.reference_noise.empty()) {
         size_t visual = 0;
         for (const Reference& ref : refs)
@@ -612,6 +660,8 @@ Engine::Latents Engine::denoise(const Request& r)
         }
         ref_layout.push_back(lr);
     }
+    if (!dit_)
+        stage("loading the transformer");
     H3& dit = transformer();
     H3::Layout layout;
     layout.text = uint32_t(text.size() / H3::kText);
@@ -646,6 +696,7 @@ Engine::Latents Engine::denoise(const Request& r)
             v = nd(rng);
     }
     (void)rpf;
+    stage("denoising");
     dit.begin(text, layout);
     const uint32_t n = uint32_t(sig_v.size()) - 1;
     // Euler as the reference steps it: the velocity points at the data (x0 = x + sigma v, sigma from the timestep

@@ -1,8 +1,9 @@
 # mako-video
 
 Video generation on Apple Silicon from the model's original files: MiniMax-H3 (text to video with a synchronized
-stereo soundtrack; a first and last frame, or reference pictures, videos and soundtracks, to condition on). A
-command-line tool (`mako_video`); a server will follow.
+stereo soundtrack; a first and last frame, or reference pictures, videos and soundtracks, to condition on). An HTTP
+server in the shape of OpenAI's video API (`mako_video_serve`), a command-line tool (`mako_video`), and a pi skill
+that makes a video of the conversation's scene through the server.
 
 It runs beside [mako](https://github.com/jhanssen/mako) (LLM inference) and
 [mako-image](https://github.com/jhanssen/mako-image) and shares their code through
@@ -115,6 +116,65 @@ weights computed in fp32; `tests/h3_ref_test`): the text encoder's output 3e-5 r
 3e-4 (the worst pixel 2 of 255 off), the audio decoder 5e-5; with keyframes, the final video rows 5e-2; with
 references (a picture, a soundtrack, a video with sound), the layout's positions 3e-12, the VAE encoders 1e-3 to 7e-6,
 the final video rows 3e-2 (docs/architecture.md has the stages).
+
+## Server
+
+`mako_video_serve --video-models DIR` serves OpenAI's video API with the models in DIR, one directory each (named by
+it): MiniMax-H3's files as published (`FL2VA`), a `Ref2VA` beside it (listed as taking references), a directory
+holding a single transformer file (a pruned merge such as H3 Eros Max; it borrows the first model's text encoder and
+VAEs), or a `mako.json` pointing at the files with settings. `--video-model NAME` is the one for requests that name
+none (default: the first by name). A video takes minutes, so the API is a job: `POST /v1/videos` queues one and
+answers at once; `GET /v1/videos/{id}` follows it; `GET /v1/videos/{id}/content` downloads the MP4.
+
+```sh
+./build/mako_video_serve --video-models ~/models/minimax-h3 --port 8083          # beside mako_serve: --llm http://127.0.0.1:8080
+curl -s localhost:8083/v1/videos -H 'Content-Type: application/json' -d '{
+  "prompt": "A red fox trots through fresh snow at sunrise; soft footsteps and distant birdsong.",
+  "size": "960x544", "seconds": 5, "steps": 9,
+  "loras": [{"name": "minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16"}]}'
+# {"id":"video_1762300000_1","object":"video","status":"queued","progress":0,...}
+curl -s localhost:8083/v1/videos/video_1762300000_1          # status queued | in_progress | completed | failed, progress, stage
+curl -s localhost:8083/v1/videos/video_1762300000_1/content -o fox.mp4
+```
+
+- `POST /v1/videos` takes `prompt` (required, at most 16384 bytes), `model` (a name from `GET /v1/videos/models`),
+  `seconds` (5 to 15, a number or OpenAI's string; snapped up to 17 n + 5 frames at 24 fps; default 5.17), `size`
+  (`WIDTHxHEIGHT` in multiples of 32, at most twice 1344x768's area; `auto`: the 16:9 canvas, or the first frame's
+  aspect ratio), `input_reference` (OpenAI's: an image file in base64 or a `data:` URL, as a string or in
+  `{"image_url": ...}`; it becomes the first frame, fl2va), and the extensions `last_frame` (the same, the last
+  frame), `references` (ref2va, a Ref2VA model: an array of `{"type": "image" | "video" | "audio", "data": BASE64}`
+  in reading order, at most 12; a video brings its soundtrack; a soundtrack cannot be the only one; files are read
+  with AVFoundation), `steps` (0: the model's 50; 9 with an 8-step turbo LoRA, 5 with a 4-step one), `seed` (a whole
+  number, as a string past 2^53; the same seed and settings give the same video), `loras` (an array of `{"name",
+  "scale"}`; `GET /v1/videos/loras?model=NAME` lists them with their step counts). Web URLs are not fetched and files
+  are not stored: send the bytes.
+- The video object: OpenAI's `id`, `object`, `created_at`, `completed_at`, `status` (`queued`, `in_progress`,
+  `completed`, `failed`), `progress` (0 to 100), `model`, `seconds`, `size`, `prompt`, `error`; and `frames`, `steps`,
+  `seed`, `loras`, `references`, `first_frame`, `last_frame`, `stage` (what it is doing: loading the model, step 3 of
+  8, writing the file) and `path` (the MP4 on this machine once completed, beside a PNG of its middle frame; default
+  `~/Movies/mako`, `--output-dir`). `GET /v1/videos` lists them (`limit`, `after`, `order`); `DELETE /v1/videos/{id}`
+  removes one and its files, a running one stopped at its next step. `GET /v1/videos/{id}/content?variant=thumbnail`
+  gives the PNG.
+- One model is in memory at a time, loaded by the first job for it and kept (its VAEs; the transformer, 66 GB or 47
+  with int8, and the text encoder, 49 GB, as below); another model or other LoRAs than the loaded ones load those
+  first. Jobs run one at a time in order; `--max-waiting N` (default 4) bounds the queue, beyond it `POST` answers
+  503. The text encoder loads for each job's prompt and is freed again unless `--keep-text-encoder`; whether the
+  transformer stays loaded meanwhile is `--keep-transformer auto|on|off` (default auto: only when the machine holds
+  both with room, 1.35 x their weight files; on a 137 GB Mac it is freed for the prompt and loaded again after it,
+  about 15 s with the LoRAs merged, where keeping it makes every step 1.7x slower from swapping: a 512x288 job with
+  the 8-step LoRA takes 95 s as the first and 109 s as the next). `GET /v1/status` says what
+  is loaded and what runs. `--host`, `--port` (default 8083), `--api-key` / `--api-key-file` (needed beyond
+  loopback), `--llm URL` and `--llm-api-key` as mako_image_serve; each also from `MAKO_VIDEO_<OPTION>`.
+- A `mako.json` in a model directory (every field optional, paths relative to it or from `~/`):
+  `{"model": "../FL2VA", "transformer": "../eros-max/h3ErosMax_beta7_bf16.safetensors", "lora_dir": "../loras",
+  "loras": {"minimax_h3_fl2v_turbo_8step_v1.1_768p_bf16": 1.0}, "steps": 9, "sparse": 0.1, "int8": "none",
+  "references": false, "description": "...", "prompting": "..."}`. LoRAs are named by file name without
+  `.safetensors`, from `lora_dir` (default the directory's `loras/`, else the parent's); a `NAME.json` beside one
+  (`{"trigger", "description", "steps"}`) is shown in the listing.
+- `tools/pi/scene-video` is a pi skill that turns the conversation into a video prompt and makes the video through
+  this server (`ln -s "$PWD/tools/pi/scene-video" ~/.pi/agent/skills/`; then ask for a video of the scene). Its
+  `scripts/render.sh` posts the job, follows it and prints the MP4's path; `models.sh` and `loras.sh` list the
+  choices.
 
 ## Tests
 
