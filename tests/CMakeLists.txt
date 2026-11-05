@@ -7,6 +7,13 @@ foreach(m tokens schedule text dit latents vae audio encode vision resize fl2va 
     set_tests_properties(h3_${m} PROPERTIES LABELS video SKIP_RETURN_CODE 77)
 endforeach()
 
+# Image files' orientation tags and the resampler, without a model.
+add_executable(image_test image_test.mm)
+target_link_libraries(image_test PRIVATE mako_videogen)
+set_source_files_properties(image_test.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+add_test(NAME image COMMAND image_test ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(image PROPERTIES LABELS cpu)
+
 # The geometry and schedules without a model.
 add_executable(geometry_test geometry_test.cpp)
 target_link_libraries(geometry_test PRIVATE mako_videogen)

@@ -274,6 +274,36 @@ void write_png(const std::string& path, uint32_t width, uint32_t height, std::sp
         throw std::runtime_error("png: cannot write " + path);
 }
 
+Image oriented(std::span<const uint8_t> rgba, uint32_t W, uint32_t H, uint32_t orientation)
+{
+    // Orientations 5 to 8 swap the axes. For an output pixel (x, y): where in the stored image it comes from.
+    const bool swap = orientation >= 5;
+    Image out;
+    out.width = swap ? H : W;
+    out.height = swap ? W : H;
+    out.rgb.resize(uint64_t(out.width) * out.height * 3);
+    for (uint32_t y = 0; y < out.height; ++y)
+        for (uint32_t x = 0; x < out.width; ++x) {
+            uint32_t sx = x, sy = y;
+            switch (orientation) {
+            case 2: sx = W - 1 - x; break;                     // mirrored
+            case 3: sx = W - 1 - x; sy = H - 1 - y; break;     // upside down
+            case 4: sy = H - 1 - y; break;                     // flipped
+            case 5: sx = y; sy = x; break;                     // transposed
+            case 6: sx = y; sy = H - 1 - x; break;             // turned 90 degrees clockwise
+            case 7: sx = W - 1 - y; sy = H - 1 - x; break;     // transposed the other way
+            case 8: sx = W - 1 - y; sy = x; break;             // turned 90 degrees counterclockwise
+            default: break;
+            }
+            const uint8_t* src = &rgba[(uint64_t(sy) * W + sx) * 4];
+            uint8_t* dst = &out.rgb[(uint64_t(y) * out.width + x) * 3];
+            dst[0] = src[0];
+            dst[1] = src[1];
+            dst[2] = src[2];
+        }
+    return out;
+}
+
 Image read_image(const std::string& path)
 {
     NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path.c_str()]];
@@ -281,15 +311,23 @@ Image read_image(const std::string& path)
     if (!src)
         throw std::runtime_error("cannot open the image " + path);
     CGImageRef image = CGImageSourceCreateImageAtIndex(src, 0, nullptr);
+    // The file's orientation tag (EXIF 1 to 8), applied below so the pixels come out the way the picture is shown.
+    uint32_t orientation = 1;
+    if (CFDictionaryRef props = CGImageSourceCopyPropertiesAtIndex(src, 0, nullptr)) {
+        if (auto* o = static_cast<CFNumberRef>(CFDictionaryGetValue(props, kCGImagePropertyOrientation))) {
+            int v = 1;
+            if (CFNumberGetValue(o, kCFNumberIntType, &v) && v >= 1 && v <= 8)
+                orientation = uint32_t(v);
+        }
+        CFRelease(props);
+    }
     CFRelease(src);
     if (!image)
         throw std::runtime_error(path + " is not an image ImageIO reads");
-    Image out;
-    out.width = uint32_t(CGImageGetWidth(image));
-    out.height = uint32_t(CGImageGetHeight(image));
-    std::vector<uint8_t> rgba(uint64_t(out.width) * out.height * 4);
+    const uint32_t W = uint32_t(CGImageGetWidth(image)), H = uint32_t(CGImageGetHeight(image));
+    std::vector<uint8_t> rgba(uint64_t(W) * H * 4);
     CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(rgba.data(), out.width, out.height, 8, uint64_t(out.width) * 4, space,
+    CGContextRef ctx = CGBitmapContextCreate(rgba.data(), W, H, 8, uint64_t(W) * 4, space,
                                              CGBitmapInfo(kCGImageAlphaPremultipliedLast) | CGBitmapInfo(kCGBitmapByteOrder32Big));
     if (!ctx) {
         CGColorSpaceRelease(space);
@@ -297,16 +335,12 @@ Image read_image(const std::string& path)
         throw std::runtime_error("cannot decode " + path);
     }
     CGContextSetRGBFillColor(ctx, 1, 1, 1, 1); // transparency over white
-    CGContextFillRect(ctx, CGRectMake(0, 0, out.width, out.height));
-    CGContextDrawImage(ctx, CGRectMake(0, 0, out.width, out.height), image);
+    CGContextFillRect(ctx, CGRectMake(0, 0, W, H));
+    CGContextDrawImage(ctx, CGRectMake(0, 0, W, H), image);
     CGContextRelease(ctx);
     CGColorSpaceRelease(space);
     CGImageRelease(image);
-    out.rgb.resize(uint64_t(out.width) * out.height * 3);
-    for (uint64_t i = 0; i < uint64_t(out.width) * out.height; ++i)
-        for (int c = 0; c < 3; ++c)
-            out.rgb[i * 3 + c] = rgba[i * 4 + c];
-    return out;
+    return oriented(rgba, W, H, orientation);
 }
 
 } // namespace mako::video
