@@ -7,6 +7,7 @@
 //   dit       the transformer on the reference's text and latents: the stages of both steps and their velocities
 //   latents   the denoising loop from the reference's noise to its final latents
 //   h3_ref_test <model dir> <reference dir> <mode>
+#include "models/qwen_vision.hpp"
 #include "video/engine.hpp"
 #include "mtl/context.hpp"
 
@@ -22,6 +23,7 @@
 #include <map>
 #include <print>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -222,6 +224,74 @@ int main(int argc, char** argv)
             compare("video velocity", vel.video, read_f32(ref / std::format("step{}_pred_video.f32", i)), H3::kVideoPatch, 2e-2);
             compare("audio velocity", vel.audio, read_f32(ref / std::format("step{}_pred_audio.f32", i)), H3::kAudioChannels, 2e-2);
         }
+    } else if (mode == "vision") {
+        // The keyframe presentation: the vision tower's merged tokens and DeepStack features for the first keyframe
+        // against the fp32 reference, then the text encoder's 50th layer over the whole presentation (labels, vision
+        // blocks, prompt) with both keyframes' features in it.
+        mako::models::QwenVision vis(model / "text_encoder", ctx);
+        std::map<std::string, std::vector<float>> vp;
+        vis.set_probe([&](const std::string& name, int layer, const float* data, size_t n) {
+            vp[layer < 0 ? name : std::format("{}{}", name, layer)] = std::vector<float>(data, data + n);
+        });
+        std::vector<mako::models::QwenVision::Features> feats;
+        for (int i = 0; i < 2; ++i) {
+            const auto rgb = read_file(ref / std::format("fl_keyframe{}.u8", i));
+            feats.push_back(vis.encode(std::span(reinterpret_cast<const uint8_t*>(rgb.data()), rgb.size()), size, size));
+            if (i == 0) { // the stages of the first keyframe: the reference holds both keyframes' patches
+                const uint32_t np = (size / 16) * (size / 16);
+                auto head = [&](const std::string& f) {
+                    const auto v = read_f32(ref / f);
+                    return std::vector<float>(v.begin(), v.begin() + uint64_t(np) * 1152);
+                };
+                compare("keyframe 0 patch embedding", vp["patch"], head("fl_vis_patch_embed.f32"), 1152, 1e-2);
+                compare("keyframe 0 block input", vp["in"], head("fl_vis_block_in.f32"), 1152, 1e-2);
+                compare("keyframe 0 block 0", vp["block0"], head("fl_vis_block0.f32"), 1152, 1e-2);
+                compare("keyframe 0 block 26", vp["block26"], head("fl_vis_block_last.f32"), 1152, 2e-2);
+            }
+        }
+        const uint32_t n0 = feats[0].rows * feats[0].cols;
+        auto first_n = [&](const std::vector<float>& v) { return std::vector<float>(v.begin(), v.begin() + uint64_t(n0) * 5120); };
+        compare("keyframe 0 vision tokens", feats[0].embeds, first_n(read_f32(ref / "fl_vis_merger.f32")), 5120, 2e-2);
+        for (int j = 0; j < 3; ++j)
+            compare(std::format("keyframe 0 DeepStack {}", j), feats[0].deepstack[j],
+                    first_n(read_f32(ref / std::format("fl_vis_deepstack{}.f32", j))), 5120, 2e-2);
+        std::vector<int32_t> ids;
+        for (const auto& v : m["fl_ids"].get_array())
+            ids.push_back(int32_t(v.get_number()));
+        std::vector<mako::models::QwenText::Vision> blocks;
+        for (size_t i = 0, t = 0; i < feats.size(); ++i) {
+            while (t < ids.size() && ids[t] != 151655) // <|image_pad|>
+                ++t;
+            mako::models::QwenText::Vision b;
+            b.first = uint32_t(t);
+            b.rows = feats[i].rows;
+            b.cols = feats[i].cols;
+            b.embeds = feats[i].embeds;
+            for (const auto& d : feats[i].deepstack)
+                b.deepstack.emplace_back(d);
+            blocks.push_back(std::move(b));
+            t += uint64_t(b.rows) * b.cols;
+        }
+        const uint32_t taps[1] = {Engine::kTextLayer};
+        const auto got = engine.text_encoder().encode(ids, 0, taps, false, blocks);
+        const auto want = read_f32(ref / "fl_text_embeds.f32");
+        compare("layer 50 with the keyframes", got, want, H3::kText, 0.03);
+        // The rows farthest off, by cosine, with their norms (an outlier row says which part of the presentation).
+        std::vector<std::tuple<double, size_t, double, double>> rows;
+        for (size_t r = 0; r < ids.size(); ++r) {
+            double dot = 0, ng = 0, nw = 0;
+            for (uint32_t c = 0; c < H3::kText; ++c) {
+                const double g = got[r * H3::kText + c], w = want[r * H3::kText + c];
+                dot += g * w;
+                ng += g * g;
+                nw += w * w;
+            }
+            rows.emplace_back(dot / std::sqrt(ng * nw + 1e-30), r, std::sqrt(ng), std::sqrt(nw));
+        }
+        std::ranges::sort(rows);
+        for (size_t i = 0; i < 4 && i < rows.size(); ++i)
+            std::println("       row {} (id {}): cosine {:.4f}, norm {:.1f} against {:.1f}", std::get<1>(rows[i]),
+                         ids[std::get<1>(rows[i])], std::get<0>(rows[i]), std::get<2>(rows[i]), std::get<3>(rows[i]));
     } else if (mode == "encode") {
         // The keyframes (already on the canvas) through the VAE encoder: the posterior's mean and standard deviation
         // against the fp32 reference, then the normalized sample with the reference's noise, and with the torch
