@@ -222,6 +222,34 @@ int main(int argc, char** argv)
             compare("video velocity", vel.video, read_f32(ref / std::format("step{}_pred_video.f32", i)), H3::kVideoPatch, 2e-2);
             compare("audio velocity", vel.audio, read_f32(ref / std::format("step{}_pred_audio.f32", i)), H3::kAudioChannels, 2e-2);
         }
+    } else if (mode == "encode") {
+        // The keyframes (already on the canvas) through the VAE encoder: the posterior's mean and standard deviation
+        // against the fp32 reference, then the normalized sample with the reference's noise, and with the torch
+        // generator reproduced.
+        auto& vae = engine.video_vae();
+        auto hwc = [&](const std::vector<float>& chw, uint32_t h, uint32_t w) { // [24][h][w] -> [h][w][24]
+            std::vector<float> o(chw.size());
+            for (uint32_t c = 0; c < 24; ++c)
+                for (uint32_t y = 0; y < h; ++y)
+                    for (uint32_t x = 0; x < w; ++x)
+                        o[(uint64_t(y) * w + x) * 24 + c] = chw[(uint64_t(c) * h + y) * w + x];
+            return o;
+        };
+        for (int i = 0; i < 2; ++i) {
+            const auto rgb = read_file(ref / std::format("fl_keyframe{}.u8", i));
+            const uint32_t h = size, w = size;
+            check(rgb.size() == uint64_t(h) * w * 3, std::format("keyframe {}: {}x{} pixels", i, w, h));
+            std::vector<float> mean, sd;
+            vae.encode_moments(std::span(reinterpret_cast<const uint8_t*>(rgb.data()), rgb.size()), h, w, mean, sd);
+            compare(std::format("keyframe {} posterior mean", i), mean, hwc(read_f32(ref / std::format("fl_cond_mean{}.f32", i)), h / 16, w / 16), 24, 2e-2);
+            compare(std::format("keyframe {} posterior sd", i), sd, hwc(read_f32(ref / std::format("fl_cond_std{}.f32", i)), h / 16, w / 16), 24, 2e-2);
+            const auto noise = hwc(read_f32(ref / std::format("fl_cond_sample_noise{}.f32", i)), h / 16, w / 16);
+            const auto want = hwc(read_f32(ref / std::format("fl_cond_latents{}.f32", i)), h / 16, w / 16);
+            const auto got = vae.encode(std::span(reinterpret_cast<const uint8_t*>(rgb.data()), rgb.size()), h, w, noise);
+            compare(std::format("keyframe {} latents (reference noise)", i), got, want, 24, 2e-2);
+            const auto own = vae.encode(std::span(reinterpret_cast<const uint8_t*>(rgb.data()), rgb.size()), h, w);
+            compare(std::format("keyframe {} latents (torch generator reproduced)", i), own, want, 24, 2e-2);
+        }
     } else if (mode == "vae" || mode == "audio") {
         Engine::Latents L;
         L.width = L.height = size;

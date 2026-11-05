@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iterator>
 #include <numbers>
+#include <random>
 #include <stdexcept>
 
 namespace mako::video {
@@ -37,7 +38,7 @@ safetensors::Files open_files(const std::string& path)
 } // namespace
 
 VideoVae::VideoVae(const std::string& dir, mtl::Context& ctx, gpu::Telemetry telemetry)
-    : TransformerRuntime(ctx, telemetry)
+    : ConvRuntime(ctx, telemetry), dir_(dir)
 {
     {
         std::ifstream in(dir + "/config.json", std::ios::binary);
@@ -353,6 +354,235 @@ void VideoVae::decode(std::span<const float> latents, uint32_t frames, uint32_t 
     }
     for (uint32_t fr = 0; fr < kFrameOverlap; ++fr)
         emit(&overlap[uint64_t(fr) * H * W * 3]);
+}
+
+void VideoVae::load_encoder()
+{
+    if (enc_)
+        return;
+    const auto f = open_files(dir_ + "/source/model.safetensors");
+    static constexpr uint32_t kMult[] = {1, 2, 2, 4, 4, 8};
+    auto conv3 = [&](const std::string& name, uint32_t stride = 1) {
+        const std::string n[1] = {name};
+        Conv c = load_conv(f, n, 3);
+        c.mode = Pad::reflect;
+        c.stride = stride;
+        c.pad = stride == 2 ? 0 : 1; // the downsample pads below and right only
+        return c;
+    };
+    auto conv1 = [&](const std::string& name) {
+        const std::string n[1] = {name};
+        return load_conv(f, n, 1);
+    };
+    auto e = std::make_unique<Encoder>();
+    e->in = conv3("encoder.conv_in");
+    uint32_t cin = kEncCh;
+    for (uint32_t l = 0; l < 6; ++l) {
+        EncLevel L;
+        const uint32_t cout = kEncCh * kMult[l];
+        for (uint32_t b = 0; b < 2; ++b) {
+            const std::string p = std::format("encoder.down.{}.block.{}.", l, b);
+            EncRes r;
+            r.g1 = upload_f32(f, p + "norm1.weight");
+            r.b1 = upload_f32(f, p + "norm1.bias");
+            r.c1 = conv3(p + "conv1");
+            r.g2 = upload_f32(f, p + "norm2.weight");
+            r.b2 = upload_f32(f, p + "norm2.bias");
+            r.c2 = conv3(p + "conv2");
+            r.shortcut = static_cast<bool>(f.find(p + "nin_shortcut.weight"));
+            if (r.shortcut)
+                r.sc = conv1(p + "nin_shortcut");
+            if (r.c1.cin != cin || r.c2.cout != cout)
+                throw std::runtime_error(p + ": unexpected widths");
+            cin = cout;
+            L.res.push_back(std::move(r));
+        }
+        if (l < 4) {
+            L.down = true;
+            L.down_conv = conv3(std::format("encoder.down.{}.downsample.conv", l), 2);
+        }
+        e->levels.push_back(std::move(L));
+    }
+    e->out_g = upload_f32(f, "encoder.norm_out.weight");
+    e->out_b = upload_f32(f, "encoder.norm_out.bias");
+    e->out = conv3("encoder.conv_out");
+    e->quant = conv1("quant_conv");
+    if (e->out.cout != 2 * kLatent || e->quant.cout != 2 * kLatent)
+        throw std::runtime_error("video VAE: the encoder does not end in 48 moments");
+    enc_ = std::move(e);
+    log::info("video VAE encoder loaded ({:.1f} GB resident in all)", double(dense_bytes_) / 1e9);
+}
+
+void VideoVae::encode_tile(std::span<const float> pixels, uint32_t th, uint32_t tw, std::vector<float>& out)
+{
+    const uint32_t rows = th * tw;
+    MTL::Buffer* x = scratch("e_x", uint64_t(rows) * 3 * 4);
+    std::memcpy(x->contents(), pixels.data(), pixels.size() * 4);
+    // Channels-last activations; the widest level is the first (128 channels at full resolution).
+    const uint64_t cap = uint64_t(rows) * kEncCh * 4;
+    MTL::Buffer* h = scratch("e_h", cap);
+    MTL::Buffer* t1 = scratch("e_t1", cap);
+    MTL::Buffer* t2 = scratch("e_t2", cap);
+    MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
+    cur_cb_ = cb;
+    MTL::ComputeCommandEncoder* enc = encoder(cb, 0, -1);
+    conv(enc, enc_->in, x, th, tw, h);
+    uint32_t hh = th, ww = tw;
+    for (const EncLevel& L : enc_->levels) {
+        for (const EncRes& r : L.res) {
+            const uint32_t n = hh * ww;
+            group_norm(enc, h, r.g1, r.b1, t1, n, r.c1.cin, true);
+            conv(enc, r.c1, t1, hh, ww, t2);
+            group_norm(enc, t2, r.g2, r.b2, t2, n, r.c2.cin, true);
+            conv(enc, r.c2, t2, hh, ww, t1);
+            if (r.shortcut) {
+                conv(enc, r.sc, h, hh, ww, t2);
+                add(enc, t2, t1, h, n * r.c2.cout);
+            } else {
+                add(enc, h, t1, h, n * r.c2.cout);
+            }
+        }
+        if (L.down) {
+            conv(enc, L.down_conv, h, hh, ww, t1);
+            std::swap(h, t1);
+            hh /= 2;
+            ww /= 2;
+        }
+    }
+    const uint32_t n = hh * ww;
+    group_norm(enc, h, enc_->out_g, enc_->out_b, t1, n, enc_->out.cin, true);
+    conv(enc, enc_->out, t1, hh, ww, t2);
+    conv(enc, enc_->quant, t2, hh, ww, t1);
+    enc->endEncoding();
+    finish(cb);
+    out.resize(uint64_t(n) * 2 * kLatent);
+    std::memcpy(out.data(), t1->contents(), out.size() * 4);
+}
+
+void VideoVae::moments(std::span<const uint8_t> rgb, uint32_t h, uint32_t w, std::vector<float>& out)
+{
+    if (!h || !w || h % kPatch || w % kPatch || rgb.size() != uint64_t(h) * w * 3)
+        throw std::runtime_error("video VAE: a keyframe [h][w][3] with h and w multiples of 16");
+    load_encoder();
+    const auto rows = tiles(h), cols = tiles(w);
+    const uint32_t lh = h / kPatch, lw = w / kPatch, C = 2 * kLatent;
+    out.assign(uint64_t(lh) * lw * C, 0.0f);
+    std::vector<float> pix, tile;
+    std::vector<std::vector<float>> row_tiles(cols.size()), prev_row(cols.size());
+    uint32_t y0 = 0;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const uint32_t tH = rows[i].size, lth = tH / kPatch;
+        for (size_t j = 0; j < cols.size(); ++j) {
+            const uint32_t tW = cols[j].size;
+            pix.resize(uint64_t(tH) * tW * 3);
+            for (uint32_t yy = 0; yy < tH; ++yy)
+                for (uint32_t xx = 0; xx < tW; ++xx)
+                    for (uint32_t c = 0; c < 3; ++c) {
+                        const uint8_t v = rgb[((uint64_t(rows[i].start + yy) * w) + cols[j].start + xx) * 3 + c];
+                        pix[(uint64_t(yy) * tW + xx) * 3 + c] = (float(v) / 255.0f - kPixelMean[c]) / kPixelStd[c];
+                    }
+            encode_tile(pix, tH, tW, row_tiles[j]);
+        }
+        // Stitched as the reference stitches: each tile blended over its overlap with the raw tile above and the raw
+        // one to its left, then cropped by the overlaps it shares with the next tiles.
+        uint32_t x0 = 0;
+        for (size_t j = 0; j < cols.size(); ++j) {
+            const uint32_t ltw = cols[j].size / kPatch;
+            tile = row_tiles[j];
+            auto at = [&](std::vector<float>& t, uint32_t yy, uint32_t xx) -> float* { return &t[(uint64_t(yy) * ltw + xx) * C]; };
+            if (i > 0) {
+                const uint32_t ov = rows[i].overlap / kPatch;
+                for (uint32_t yy = 0; yy < ov; ++yy) {
+                    const float wb = float(yy) / float(ov), wa = 1.0f - wb;
+                    const float* a = at(prev_row[j], lth - ov + yy, 0);
+                    float* b = at(tile, yy, 0);
+                    for (uint32_t k = 0; k < ltw * C; ++k)
+                        b[k] = a[k] * wa + b[k] * wb;
+                }
+            }
+            if (j > 0) {
+                const uint32_t ov = cols[j].overlap / kPatch;
+                for (uint32_t yy = 0; yy < lth; ++yy)
+                    for (uint32_t xx = 0; xx < ov; ++xx) {
+                        const float wb = float(xx) / float(ov), wa = 1.0f - wb;
+                        const float* a = at(row_tiles[j - 1], yy, ltw - ov + xx);
+                        float* b = at(tile, yy, xx);
+                        for (uint32_t k = 0; k < C; ++k)
+                            b[k] = a[k] * wa + b[k] * wb;
+                    }
+            }
+            const uint32_t keep_h = i + 1 < rows.size() ? lth - rows[i + 1].overlap / kPatch : lth;
+            const uint32_t keep_w = j + 1 < cols.size() ? ltw - cols[j + 1].overlap / kPatch : ltw;
+            for (uint32_t yy = 0; yy < keep_h; ++yy)
+                std::copy_n(at(tile, yy, 0), uint64_t(keep_w) * C, &out[((uint64_t(y0) + yy) * lw + x0) * C]);
+            x0 += keep_w;
+        }
+        y0 += i + 1 < rows.size() ? lth - rows[i + 1].overlap / kPatch : lth;
+        prev_row.swap(row_tiles);
+    }
+}
+
+void VideoVae::encode_moments(std::span<const uint8_t> rgb, uint32_t h, uint32_t w, std::vector<float>& mean,
+                              std::vector<float>& sd)
+{
+    std::vector<float> m;
+    moments(rgb, h, w, m);
+    const uint64_t n = m.size() / (2 * kLatent);
+    mean.resize(n * kLatent);
+    sd.resize(n * kLatent);
+    for (uint64_t v = 0; v < n; ++v)
+        for (uint32_t c = 0; c < kLatent; ++c) {
+            mean[v * kLatent + c] = m[v * 2 * kLatent + c];
+            sd[v * kLatent + c] = std::exp(0.5f * std::clamp(m[v * 2 * kLatent + kLatent + c], -30.0f, 20.0f));
+        }
+}
+
+std::vector<float> VideoVae::torch_randn(size_t n, uint32_t seed)
+{
+    if (n < 16)
+        throw std::runtime_error("torch_randn: at least 16 values");
+    std::mt19937 g(seed);
+    auto uniform = [&] { return float(g() & 0xffffffu) * (1.0f / 16777216.0f); };
+    std::vector<float> d(n);
+    for (float& v : d)
+        v = uniform();
+    auto box = [&](size_t j) {
+        for (size_t k = 0; k < 8; ++k) {
+            const float u1 = 1.0f - d[j + k], u2 = d[j + k + 8];
+            const float radius = std::sqrt(-2.0f * std::log(u1)), theta = 2.0f * std::numbers::pi_v<float> * u2;
+            d[j + k] = radius * std::cos(theta);
+            d[j + k + 8] = radius * std::sin(theta);
+        }
+    };
+    for (size_t j = 0; j + 16 <= n; j += 16)
+        box(j);
+    if (n % 16) { // the tail is redrawn from fresh uniforms
+        for (size_t k = n - 16; k < n; ++k)
+            d[k] = uniform();
+        box(n - 16);
+    }
+    return d;
+}
+
+std::vector<float> VideoVae::encode(std::span<const uint8_t> rgb, uint32_t h, uint32_t w, std::span<const float> noise)
+{
+    std::vector<float> mean, sd;
+    encode_moments(rgb, h, w, mean, sd);
+    const uint32_t lh = h / kPatch, lw = w / kPatch;
+    if (!noise.empty() && noise.size() != mean.size())
+        throw std::runtime_error("video VAE: the noise is not [h / 16][w / 16][24]");
+    // torch draws the sample channel-major ([24][h][w]); the latents here are [h][w][24].
+    const std::vector<float> drawn = noise.empty() ? torch_randn(mean.size(), kEncodeSeed) : std::vector<float>();
+    std::vector<float> z(mean.size());
+    for (uint32_t c = 0; c < kLatent; ++c)
+        for (uint32_t y = 0; y < lh; ++y)
+            for (uint32_t x = 0; x < lw; ++x) {
+                const uint64_t i = (uint64_t(y) * lw + x) * kLatent + c;
+                const float e = noise.empty() ? drawn[(uint64_t(c) * lh + y) * lw + x] : noise[i];
+                const float v = float(__fp16(mean[i] + sd[i] * e)); // the sample kept to fp16
+                z[i] = (v - mean_[c]) / std_[c];
+            }
+    return z;
 }
 
 } // namespace mako::video
