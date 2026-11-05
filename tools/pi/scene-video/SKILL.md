@@ -9,17 +9,20 @@ Turn what the conversation has established into one video prompt, make it with m
 A video takes minutes (the model's notes say how many); say so before starting, and do not start another one until it
 is done.
 
-0. Pick the model (`scripts/models.sh` lists them: the plain one for text, keyframes; the Ref2VA one for references) and
-   its LoRA (`scripts/loras.sh MODEL`: a turbo LoRA runs 8 steps in a quarter of the time; `--steps 9` goes with an
-   8-step one, `--steps 5` with a 4-step one).
+0. Pick the model (`scripts/models.sh` lists them with their default LoRAs and steps: the plain one for text and
+   keyframes, the Ref2VA one for references, a merge such as eros-max). The listing's defaults are what a render
+   gets; pass `--lora` / `--steps` only to change them (`scripts/loras.sh MODEL` lists the LoRAs: a turbo LoRA runs
+   8 steps in a quarter of the time; `--steps 9` goes with an 8-step one, `--steps 5` with a 4-step one; `--no-loras
+   --steps 0` is the 50-step base model, five times slower).
 1. Write the prompt as "Writing the prompt" below says.
-2. Pick a size: 1344x768 for a wide scene, 768x1344 for a tall one, 960x544 or 512x288 for a quick look (each side a
-   multiple of 32); `auto` takes the first frame's aspect ratio when there is one, else 1344x768. Pick a length,
-   `--seconds 5` to `15` (default 5.2).
+2. Pick a size and a length (`--seconds 5` to `15`, default 5.2). Time grows with both: with the 8-step LoRA a 5 s
+   clip takes about 95 s at 512x288, 6 min at 960x544 and 19 min at 1344x768 (the model's full canvas), and an 8 s
+   clip about 1.7x those. Use 512x288 or 960x544 to try a prompt and the full canvas for a keeper. 768x1344 for a tall
+   scene; each side a multiple of 32; `auto` takes the first frame's aspect ratio when there is one, else 1344x768.
 3. Run, from this skill's directory:
 
    ```sh
-   scripts/render.sh --model MODEL --lora LORA --steps 9 [--seconds F] WIDTHxHEIGHT "<the prompt>"
+   scripts/render.sh --model MODEL [--seconds F] WIDTHxHEIGHT "<the prompt>"
    ```
 
    With a picture to start from: `--first-frame FILE` (and `--last-frame FILE` for where it ends). With references
