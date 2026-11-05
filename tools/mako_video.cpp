@@ -1,6 +1,7 @@
 // Text to video with audio with MiniMax-H3 from its original files.
 //   mako_video <model dir> <prompt> [-o out.mp4] [--width N --height N] [--seconds F | --frames N] [--steps N]
-//              [--seed N] [--image FILE] [--last-image FILE] [--lora FILE[:SCALE] ...] [--still FILE] [--frames-dir DIR]
+//              [--seed N] [--image FILE] [--last-image FILE] [--ref-image FILE | --ref-video FILE | --ref-audio FILE ...]
+//              [--lora FILE[:SCALE] ...] [--still FILE] [--frames-dir DIR]
 //              [--int8 LIST] [--sparse RATIO] [--keep-text-encoder]
 //              [--text-encoder DIR]
 //              [--transformer PATH] [--llm URL] [--llm-api-key KEY]
@@ -16,6 +17,7 @@
 #include "mtl/context.hpp"
 #include "video/engine.hpp"
 #include "video/image.hpp"
+#include "video/media.hpp"
 #include "video/mp4.hpp"
 
 #include <Foundation/Foundation.hpp>
@@ -72,6 +74,7 @@ int main(int argc, char** argv)
     double sparse = 0;
     uint32_t sparse_local = 1;
     std::vector<mako::video::Lora> loras;
+    std::vector<std::pair<mako::video::Reference::Kind, std::string>> refs; // ref2va references in reading order
     mako::app::Cli cli("mako_video", "<model dir> <prompt>", 2, 2);
     cli.option("-o", "FILE", "the MP4 to write (default video.mp4)", out)
         .option("--width", "N", "pixels, a multiple of 32 (default: the 16:9 canvas, 1344)", width)
@@ -84,6 +87,12 @@ int main(int argc, char** argv)
                 [&](const std::string& v) { loras.push_back(parse_lora(v)); })
         .option("--image", "FILE", "the first frame (fl2va): the canvas takes its aspect ratio unless --width / --height", image)
         .option("--last-image", "FILE", "the last frame (fl2va), cover-cropped onto the canvas", last_image)
+        .option("--ref-image", "FILE", "a picture the video takes after (ref2va, repeatable with the others in reading order)",
+                [&](const std::string& v) { refs.emplace_back(mako::video::Reference::Kind::image, v); })
+        .option("--ref-video", "FILE", "a video, with its soundtrack when it has one, the video takes after (ref2va)",
+                [&](const std::string& v) { refs.emplace_back(mako::video::Reference::Kind::video, v); })
+        .option("--ref-audio", "FILE", "a soundtrack the video takes after (ref2va; not on its own)",
+                [&](const std::string& v) { refs.emplace_back(mako::video::Reference::Kind::audio, v); })
         .option("--still", "FILE", "also write the middle frame as a PNG", still)
         .option("--frames-dir", "DIR", "also write every frame as DIR/NNN.png", frames_dir)
         .flag("--keep-text-encoder", "keep the text encoder loaded beside the transformer", keep_text)
@@ -142,6 +151,39 @@ int main(int argc, char** argv)
             r.first = mako::video::read_image(image);
         if (!last_image.empty())
             r.last = mako::video::read_image(last_image);
+        // The references, as much of each file as the generation is long.
+        const double seconds_wanted = double(mako::video::Engine::align_frames(r.frames)) / mako::video::Engine::kFps;
+        for (const auto& [kind, path] : refs) {
+            mako::video::Reference ref;
+            ref.kind = kind;
+            if (kind == mako::video::Reference::Kind::image) {
+                ref.image = mako::video::read_image(path);
+            } else {
+                const bool video = kind == mako::video::Reference::Kind::video;
+                auto media = mako::video::read_media(path, video, true, seconds_wanted);
+                if (video) {
+                    if (!media.frames)
+                        throw std::runtime_error(path + ": no video track");
+                    ref.frames = media.frames;
+                    ref.width = media.width;
+                    ref.height = media.height;
+                    ref.fps = media.fps;
+                    ref.rgb = std::move(media.rgb);
+                } else if (!media.channels) {
+                    throw std::runtime_error(path + ": no audio track");
+                }
+                ref.audio = std::move(media.audio);
+                ref.channels = media.channels;
+                ref.sample_rate = media.sample_rate;
+                mako::log::info("{}: {}{}", path,
+                                video ? std::format("{} frames of {}x{} at {:.3g} fps", ref.frames, ref.width, ref.height, ref.fps) : std::string(),
+                                ref.has_audio() ? std::format("{}{} channel{} at {} Hz, {:.2f} s", video ? ", " : "", ref.channels,
+                                                              ref.channels == 1 ? "" : "s", ref.sample_rate,
+                                                              double(ref.audio.size() / ref.channels) / ref.sample_rate)
+                                                : video ? std::string(", no soundtrack") : std::string());
+            }
+            r.references.push_back(std::move(ref));
+        }
         auto t_step = Clock::now();
         r.progress = [&](uint32_t i, uint32_t total) {
             mako::log::info("step {} of {}: {:.1f} s, thermal {}", i, total, since(t_step), thermal_state());

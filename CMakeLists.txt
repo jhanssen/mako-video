@@ -29,15 +29,17 @@ set(S ${CMAKE_CURRENT_SOURCE_DIR}/src)
 mako_add_kernels(video_kernels SOURCES ${S}/kernels/video.metal)
 
 add_library(mako_videogen STATIC ${S}/video/h3.cpp ${S}/video/video_vae.cpp ${S}/video/audio_vae.cpp
-            ${S}/video/engine.cpp ${S}/video/mp4.mm ${S}/video/image.cpp)
+            ${S}/video/engine.cpp ${S}/video/mp4.mm ${S}/video/image.cpp ${S}/video/media.mm ${S}/video/audio.cpp)
 target_include_directories(mako_videogen PUBLIC ${S})
 target_link_libraries(mako_videogen PUBLIC mako_gpu mako_models mako_safetensors mako_text mako_log
                       PRIVATE glaze_headers "-framework AVFoundation" "-framework CoreMedia" "-framework CoreVideo"
                       "-framework Foundation" "-framework ImageIO" "-framework CoreGraphics")
-set_source_files_properties(${S}/video/mp4.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+set_source_files_properties(${S}/video/mp4.mm ${S}/video/media.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 
 add_executable(mako_video tools/mako_video.cpp)
 target_link_libraries(mako_video PRIVATE mako_videogen mako_memory mako_app)
+add_executable(mako_clip tools/mako_clip.cpp)
+target_link_libraries(mako_clip PRIVATE mako_videogen)
 
 # Model-backed tests need the model's directory and the reference tensors; without them they report as skipped.
 set(MAKO_H3 "$ENV{MAKO_H3}" CACHE PATH "MiniMax-H3 FL2VA directory (its original files) for its tests")

@@ -21,5 +21,8 @@ Image oriented(std::span<const uint8_t> rgba, uint32_t W, uint32_t H, uint32_t o
 // `img` resampled to width x height with a 3-lobe Lanczos filter as PIL's resize does it (the filter widened by the
 // ratio when shrinking, each pass rounded to 8 bits).
 Image resize_lanczos(const Image& img, uint32_t width, uint32_t height);
+// Bicubic (a = -0.5) with antialiasing, separably, as torchvision resizes 8-bit frames: what the video processor
+// does to a reference video's sampled frames.
+Image resize_bicubic(const Image& img, uint32_t width, uint32_t height);
 
 } // namespace mako::video

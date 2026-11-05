@@ -44,6 +44,13 @@ public:
     // The posterior's mean and standard deviation, [h / 16][w / 16][24] each.
     void encode_moments(std::span<const uint8_t> rgb, uint32_t h, uint32_t w, std::vector<float>& mean,
                         std::vector<float>& sd);
+    // A reference video's frames [F][h][w][3] (F = 17 n + 5 at 24 fps) to its normalized latents [5 n + 2][h / 16]
+    // [w / 16][24]: the causal 3D encoder over 17-frame clips (the frames padded by repeating the last one, the last
+    // three latents dropped), tiled and sampled as encode(); the 3D weights are loaded on first use.
+    std::vector<float> encode_video(std::span<const uint8_t> rgb, uint32_t frames, uint32_t h, uint32_t w,
+                                    std::span<const float> noise = {});
+    void encode_video_moments(std::span<const uint8_t> rgb, uint32_t frames, uint32_t h, uint32_t w,
+                              std::vector<float>& mean, std::vector<float>& sd);
     // torch's CPU randn(n, generator=manual_seed(seed)): mt19937's 24-bit uniforms through Box-Muller over blocks of
     // 16 (matches to about 1e-6; n at least 16).
     static std::vector<float> torch_randn(size_t n, uint32_t seed);
@@ -84,8 +91,16 @@ private:
         Tensor out_g, out_b;
         std::vector<EncLevel> levels;
     };
-    std::unique_ptr<Encoder> enc_;
+    std::unique_ptr<Encoder> enc_, enc3d_; // single-frame weights (the last time taps) and all three taps
     void load_encoder();
+    void load_encoder3d();
+    void load_encoder_impl(bool temporal);
+    // The 3D encoder over one clip tile [T][th][tw][3] (ImageNet-normalized) to moments [T'][th / 16][tw / 16][48].
+    void encode_clip_tile(std::span<const float> pixels, uint32_t T, uint32_t th, uint32_t tw, std::vector<float>& out,
+                          uint32_t& T_out);
+    // A whole frame stack's moments [F'][h / 16][w / 16][48], tiles blended, clips concatenated, the tail dropped.
+    void video_moments(std::span<const uint8_t> rgb, uint32_t frames, uint32_t h, uint32_t w, std::vector<float>& out,
+                       uint32_t& latent_frames);
     // One tile of ImageNet-normalized pixels [th][tw][3] to its moments [th / 16][tw / 16][48] (mean, log variance).
     void encode_tile(std::span<const float> pixels, uint32_t th, uint32_t tw, std::vector<float>& moments);
     // The whole frame's moments, tiles blended.

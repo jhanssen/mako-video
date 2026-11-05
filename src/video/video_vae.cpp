@@ -356,15 +356,18 @@ void VideoVae::decode(std::span<const float> latents, uint32_t frames, uint32_t 
         emit(&overlap[uint64_t(fr) * H * W * 3]);
 }
 
-void VideoVae::load_encoder()
+void VideoVae::load_encoder() { load_encoder_impl(false); }
+void VideoVae::load_encoder3d() { load_encoder_impl(true); }
+
+void VideoVae::load_encoder_impl(bool temporal)
 {
-    if (enc_)
+    if (temporal ? enc3d_ : enc_)
         return;
     const auto f = open_files(dir_ + "/source/model.safetensors");
     static constexpr uint32_t kMult[] = {1, 2, 2, 4, 4, 8};
     auto conv3 = [&](const std::string& name, uint32_t stride = 1) {
         const std::string n[1] = {name};
-        Conv c = load_conv(f, n, 3);
+        Conv c = load_conv(f, n, 3, temporal);
         c.mode = Pad::reflect;
         c.stride = stride;
         c.pad = stride == 2 ? 0 : 1; // the downsample pads below and right only
@@ -409,8 +412,188 @@ void VideoVae::load_encoder()
     e->quant = conv1("quant_conv");
     if (e->out.cout != 2 * kLatent || e->quant.cout != 2 * kLatent)
         throw std::runtime_error("video VAE: the encoder does not end in 48 moments");
-    enc_ = std::move(e);
-    log::info("video VAE encoder loaded ({:.1f} GB resident in all)", double(dense_bytes_) / 1e9);
+    (temporal ? enc3d_ : enc_) = std::move(e);
+    log::info("video VAE encoder loaded{} ({:.1f} GB resident in all)", temporal ? " with its time taps" : "",
+              double(dense_bytes_) / 1e9);
+}
+
+void VideoVae::encode_clip_tile(std::span<const float> pixels, uint32_t T, uint32_t th, uint32_t tw,
+                                std::vector<float>& out, uint32_t& T_out)
+{
+    static constexpr uint32_t kTimeDown[6] = {1, 2, 2, 1, 1, 1};
+    const uint32_t rows = th * tw;
+    MTL::Buffer* x = scratch("e3_x", uint64_t(T) * rows * 3 * 4);
+    std::memcpy(x->contents(), pixels.data(), pixels.size() * 4);
+    const uint64_t cap = uint64_t(T) * rows * kEncCh * 4;
+    MTL::Buffer* h = scratch("e3_h", cap);
+    MTL::Buffer* t1 = scratch("e3_t1", cap);
+    MTL::Buffer* t2 = scratch("e3_t2", cap);
+    MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
+    cur_cb_ = cb;
+    MTL::ComputeCommandEncoder* enc = encoder(cb, 0, -1);
+    const Encoder& E = *enc3d_;
+    conv3d(enc, E.in, x, T, th, tw, 1, h);
+    uint32_t hh = th, ww = tw, Tc = T;
+    // Group norms are per frame (the checkpoint's time-isolated norm).
+    auto gn = [&](MTL::Buffer* src, const Tensor& g, const Tensor& b, MTL::Buffer* dst, uint32_t c) {
+        for (uint32_t f = 0; f < Tc; ++f)
+            group_norm(enc, src, g, b, dst, hh * ww, c, true, 1e-6f, uint64_t(f) * hh * ww * c * 4, uint64_t(f) * hh * ww * c * 4);
+    };
+    for (size_t l = 0; l < E.levels.size(); ++l) {
+        const EncLevel& L = E.levels[l];
+        for (const EncRes& r : L.res) {
+            const uint32_t n = Tc * hh * ww;
+            gn(h, r.g1, r.b1, t1, r.c1.cin);
+            conv3d(enc, r.c1, t1, Tc, hh, ww, 1, t2);
+            gn(t2, r.g2, r.b2, t2, r.c2.cin);
+            conv3d(enc, r.c2, t2, Tc, hh, ww, 1, t1);
+            if (r.shortcut) {
+                conv(enc, r.sc, h, Tc * hh, ww, t2); // 1x1: every frame's pixels as rows
+                add(enc, t2, t1, h, n * r.c2.cout);
+            } else {
+                add(enc, h, t1, h, n * r.c2.cout);
+            }
+        }
+        if (L.down) {
+            conv3d(enc, L.down_conv, h, Tc, hh, ww, kTimeDown[l], t1);
+            std::swap(h, t1);
+            Tc = frames_out(Tc, kTimeDown[l]);
+            hh /= 2;
+            ww /= 2;
+        }
+    }
+    gn(h, E.out_g, E.out_b, t1, E.out.cin);
+    conv3d(enc, E.out, t1, Tc, hh, ww, 1, t2);
+    conv(enc, E.quant, t2, Tc * hh, ww, t1);
+    enc->endEncoding();
+    finish(cb);
+    T_out = Tc;
+    out.resize(uint64_t(Tc) * hh * ww * 2 * kLatent);
+    std::memcpy(out.data(), t1->contents(), out.size() * 4);
+}
+
+void VideoVae::video_moments(std::span<const uint8_t> rgb, uint32_t frames, uint32_t h, uint32_t w,
+                             std::vector<float>& out, uint32_t& latent_frames)
+{
+    constexpr uint32_t kClip = 17, kDrop = 3;
+    if (frames < 2 || !h || !w || h % kPatch || w % kPatch || rgb.size() != uint64_t(frames) * h * w * 3)
+        throw std::runtime_error("video VAE: frames [F][h][w][3] with h and w multiples of 16");
+    load_encoder3d();
+    const uint32_t padded = (frames + kClip - 1) / kClip * kClip, chunks = padded / kClip;
+    const auto rows = tiles(h), cols = tiles(w);
+    const uint32_t lh = h / kPatch, lw = w / kPatch, C = 2 * kLatent;
+    std::vector<float> all; // [chunk latents][lh][lw][C] concatenated
+    std::vector<float> pix, tile, mom;
+    std::vector<std::vector<float>> row_tiles(cols.size()), prev_row(cols.size());
+    uint32_t total = 0;
+    for (uint32_t ci = 0; ci < chunks; ++ci) {
+        std::vector<float> canvas; // this clip's stitched moments [Tc][lh][lw][C]
+        uint32_t Tc = 0, y0 = 0;
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const uint32_t tH = rows[i].size, lth = tH / kPatch;
+            for (size_t j = 0; j < cols.size(); ++j) {
+                const uint32_t tW = cols[j].size;
+                pix.resize(uint64_t(kClip) * tH * tW * 3);
+                for (uint32_t f = 0; f < kClip; ++f) {
+                    const uint32_t src = std::min(ci * kClip + f, frames - 1); // the last frame repeated past the end
+                    for (uint32_t yy = 0; yy < tH; ++yy)
+                        for (uint32_t xx = 0; xx < tW; ++xx)
+                            for (uint32_t c = 0; c < 3; ++c) {
+                                const uint8_t v = rgb[(((uint64_t(src) * h) + rows[i].start + yy) * w + cols[j].start + xx) * 3 + c];
+                                pix[((uint64_t(f) * tH + yy) * tW + xx) * 3 + c] = (float(v) / 255.0f - kPixelMean[c]) / kPixelStd[c];
+                            }
+                }
+                encode_clip_tile(pix, kClip, tH, tW, row_tiles[j], Tc);
+            }
+            if (canvas.empty())
+                canvas.assign(uint64_t(Tc) * lh * lw * C, 0.0f);
+            uint32_t x0 = 0;
+            for (size_t j = 0; j < cols.size(); ++j) {
+                const uint32_t ltw = cols[j].size / kPatch;
+                tile = row_tiles[j];
+                auto at = [&](std::vector<float>& t, uint32_t f, uint32_t yy, uint32_t xx) -> float* {
+                    return &t[((uint64_t(f) * lth + yy) * ltw + xx) * C];
+                };
+                if (i > 0) {
+                    const uint32_t ov = rows[i].overlap / kPatch;
+                    for (uint32_t f = 0; f < Tc; ++f)
+                        for (uint32_t yy = 0; yy < ov; ++yy) {
+                            const float wb = float(yy) / float(ov), wa = 1.0f - wb;
+                            const float* a = at(prev_row[j], f, lth - ov + yy, 0);
+                            float* b = at(tile, f, yy, 0);
+                            for (uint32_t k = 0; k < ltw * C; ++k)
+                                b[k] = a[k] * wa + b[k] * wb;
+                        }
+                }
+                if (j > 0) {
+                    const uint32_t ov = cols[j].overlap / kPatch;
+                    for (uint32_t f = 0; f < Tc; ++f)
+                        for (uint32_t yy = 0; yy < lth; ++yy)
+                            for (uint32_t xx = 0; xx < ov; ++xx) {
+                                const float wb = float(xx) / float(ov), wa = 1.0f - wb;
+                                const float* a = at(row_tiles[j - 1], f, yy, ltw - ov + xx);
+                                float* b = at(tile, f, yy, xx);
+                                for (uint32_t k = 0; k < C; ++k)
+                                    b[k] = a[k] * wa + b[k] * wb;
+                            }
+                }
+                const uint32_t keep_h = i + 1 < rows.size() ? lth - rows[i + 1].overlap / kPatch : lth;
+                const uint32_t keep_w = j + 1 < cols.size() ? ltw - cols[j + 1].overlap / kPatch : ltw;
+                for (uint32_t f = 0; f < Tc; ++f)
+                    for (uint32_t yy = 0; yy < keep_h; ++yy)
+                        std::copy_n(at(tile, f, yy, 0), uint64_t(keep_w) * C,
+                                    &canvas[((uint64_t(f) * lh + y0 + yy) * lw + x0) * C]);
+                x0 += keep_w;
+            }
+            y0 += i + 1 < rows.size() ? lth - rows[i + 1].overlap / kPatch : lth;
+            prev_row.swap(row_tiles);
+        }
+        all.insert(all.end(), canvas.begin(), canvas.end());
+        total += Tc;
+    }
+    if (total <= kDrop)
+        throw std::runtime_error("video VAE: too few latent frames");
+    latent_frames = total - kDrop;
+    out.assign(all.begin(), all.begin() + uint64_t(latent_frames) * lh * lw * C);
+}
+
+void VideoVae::encode_video_moments(std::span<const uint8_t> rgb, uint32_t frames, uint32_t h, uint32_t w,
+                                    std::vector<float>& mean, std::vector<float>& sd)
+{
+    std::vector<float> m;
+    uint32_t F = 0;
+    video_moments(rgb, frames, h, w, m, F);
+    const uint64_t n = m.size() / (2 * kLatent);
+    mean.resize(n * kLatent);
+    sd.resize(n * kLatent);
+    for (uint64_t v = 0; v < n; ++v)
+        for (uint32_t c = 0; c < kLatent; ++c) {
+            mean[v * kLatent + c] = m[v * 2 * kLatent + c];
+            sd[v * kLatent + c] = std::exp(0.5f * std::clamp(m[v * 2 * kLatent + kLatent + c], -30.0f, 20.0f));
+        }
+}
+
+std::vector<float> VideoVae::encode_video(std::span<const uint8_t> rgb, uint32_t frames, uint32_t h, uint32_t w,
+                                          std::span<const float> noise)
+{
+    std::vector<float> mean, sd;
+    encode_video_moments(rgb, frames, h, w, mean, sd);
+    const uint32_t lh = h / kPatch, lw = w / kPatch, F = uint32_t(mean.size() / (uint64_t(lh) * lw * kLatent));
+    if (!noise.empty() && noise.size() != mean.size())
+        throw std::runtime_error("video VAE: the noise is not [frames][h / 16][w / 16][24]");
+    // torch draws the sample as [24][F][h][w]; the latents here are [F][h][w][24].
+    const std::vector<float> drawn = noise.empty() ? torch_randn(mean.size(), kEncodeSeed) : std::vector<float>();
+    std::vector<float> z(mean.size());
+    for (uint32_t c = 0; c < kLatent; ++c)
+        for (uint32_t f = 0; f < F; ++f)
+            for (uint32_t y = 0; y < lh; ++y)
+                for (uint32_t x = 0; x < lw; ++x) {
+                    const uint64_t i = ((uint64_t(f) * lh + y) * lw + x) * kLatent + c;
+                    const float e = noise.empty() ? drawn[((uint64_t(c) * F + f) * lh + y) * lw + x] : noise[i];
+                    const float v = float(__fp16(mean[i] + sd[i] * e));
+                    z[i] = (v - mean_[c]) / std_[c];
+                }
+    return z;
 }
 
 void VideoVae::encode_tile(std::span<const float> pixels, uint32_t th, uint32_t tw, std::vector<float>& out)

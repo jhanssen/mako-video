@@ -51,33 +51,76 @@ public:
     // Modality tags, which index the AdaLN table with the timestep.
     static constexpr uint32_t kVideoTag = 0, kTextTag = 1, kAudioTag = 2;
 
-    // The packed sequence of a generation: text rows, then the keyframe conditioning frames (fl2va), the audio rows
-    // (channel-major: every latent of the left channel, then the right's) and the generated video rows (frame-major,
-    // then row-major over 2x2 patches of the latent frame).
+    // The packed sequence of a generation: text rows; then the conditioning the task brings, fl2va's keyframes
+    // (frames on the canvas) or ref2va's references in reading order (an image's rows, a soundtrack's audio rows, a
+    // video's audio rows then its video rows, each on its own grid); then the generated audio rows (channel-major:
+    // every latent of the left channel, then the right's) and the generated video rows (frame-major, then row-major
+    // over 2x2 patches of the latent frame). The video rows step() takes are the conditioning ones first (keyframes,
+    // then the references' in order), then the generated; the audio rows the references' first.
     struct Layout {
         uint32_t text = 0;
         uint32_t frames = 0;      // generated latent frames
         uint32_t h = 0, w = 0;    // latent height and width (even)
         uint32_t audio = 0;       // audio latents a channel
-        uint32_t cond_frames = 0; // keyframe conditioning frames before the generated ones
+        uint32_t cond_frames = 0; // keyframe conditioning frames before the generated ones (fl2va)
         std::vector<uint8_t> cond_last; // per conditioning frame: anchored at the last generated frame (else the first)
+        struct Reference {
+            enum class Kind : uint8_t { image, audio, video };
+            Kind kind = Kind::image;
+            uint32_t frames = 0, h = 0, w = 0; // image, video: latent frames (an image's 1), latent height and width (even)
+            uint32_t audio = 0;                // audio, or a video's soundtrack: latents a channel (0: a silent video)
+            uint32_t video_rows() const { return kind == Kind::audio ? 0 : frames * (h / 2) * (w / 2); }
+            uint32_t audio_rows() const { return 2 * audio; }
+        };
+        std::vector<Reference> refs;    // ref2va's references in reading order (not together with keyframes)
         std::vector<uint8_t> text_tags; // a tag per text row (kTextTag, or kVideoTag for a vision block's); empty:
                                         // all text
         uint32_t rows_per_frame() const { return (h / 2) * (w / 2); }
-        uint32_t cond_rows() const { return cond_frames * rows_per_frame(); }
-        uint32_t video_rows() const { return (cond_frames + frames) * rows_per_frame(); }
-        uint32_t audio_rows() const { return 2 * audio; }
+        uint32_t cond_rows() const // conditioning video rows: the keyframes' and the references'
+        {
+            uint32_t n = cond_frames * rows_per_frame();
+            for (const Reference& r : refs)
+                n += r.video_rows();
+            return n;
+        }
+        uint32_t cond_audio_rows() const
+        {
+            uint32_t n = 0;
+            for (const Reference& r : refs)
+                n += r.audio_rows();
+            return n;
+        }
+        uint32_t video_rows() const { return cond_rows() + frames * rows_per_frame(); }
+        uint32_t audio_rows() const { return cond_audio_rows() + 2 * audio; }
         uint32_t rows() const { return text + video_rows() + audio_rows(); }
     };
+    // Every row of a layout's sequence: its rotary position (t, h, w) as the reference lays them out (the text on the
+    // time axis at its row index, a shared clock continuing from there that every block advances: an image one unit,
+    // audio one a latent, video 5/3 x (1, 4, 4, 4, 4) units a latent frame; the spatial axes centred on the unit
+    // square of the block's own grid, times 32), its modality tag and its role; and the video and audio segments of
+    // the sequence, each with its first sequence row and its first row in what step() takes.
+    enum Role : uint8_t { kRoleText, kRoleCondVideo, kRoleCondAudio, kRoleAudio, kRoleVideo };
+    struct Segment {
+        bool audio;
+        uint32_t row0, n, src;
+    };
+    struct Rows {
+        std::vector<double> pos; // [rows][3]
+        std::vector<uint8_t> tags, roles;
+        std::vector<Segment> segments;
+    };
+    static Rows rows(const Layout& l);
     // Begins a generation: the text embeddings [text][5120] through the condition projection and the token refiner
     // (kept for every step), the layout's rotary positions and tags.
     void begin(std::span<const float> text, const Layout& layout);
-    // One forward: the video rows [video_rows()][96] (conditioning rows first) and audio rows [audio_rows()][32] at
-    // noise levels t = 1 - sigma (t_video for the generated video rows and the text, t_audio for the audio, t_cond
-    // for the conditioning rows), their velocities out (conditioning rows' zero).
+    // One forward: the video rows [video_rows()][96] (conditioning rows first) and audio rows [audio_rows()][32]
+    // (reference rows first) at noise levels t = 1 - sigma (t_video for the generated video rows and the text,
+    // t_audio for the generated audio, t_cond for the conditioning video rows; reference audio rows are clean, at
+    // kCondAudioT), their velocities out (conditioning and reference rows' zero).
     struct Velocity {
         std::vector<float> video, audio;
     };
+    static constexpr float kCondAudioT = 1.0f;
     Velocity step(std::span<const float> video, std::span<const float> audio, float t_video, float t_audio,
                   float t_cond = 0.999f);
     const Layout& layout() const { return layout_; }
@@ -114,6 +157,7 @@ private:
     bool curve_ = false;
     std::vector<float> table_; // [1025][8]
     Layout layout_;
+    Rows rows_;
     std::vector<uint32_t> tags_; // a modality tag per row
     uint32_t cond_rows_ = 0, S_ = 0;
     // Sparse attention: the attention's own row order [video cubes (padded) | text | conditions | audio], as a map

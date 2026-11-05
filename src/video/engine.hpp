@@ -27,12 +27,27 @@ struct Options {
     uint32_t int8 = 0; // H3::Int8: the transformer blocks' matrices kept as int8
     float sparse = 0;  // H3::set_sparse: the share of video cubes each cube attends (0: dense attention)
     uint32_t sparse_local = 1; // the cubes kept regardless of score: 0 none, 1 the cube itself, 3 with its neighbours
+    uint32_t reference_short_edge = 2048; // the short edge a ref2va picture is encoded at (the released pipeline's)
 };
 
 // A LoRA file and its scale, merged into the transformer's weights.
 struct Lora {
     std::string path;
     float scale = 1.0f;
+};
+
+// A ref2va reference as it comes from its file, at any size, frame rate or sample rate: a picture, a video with its
+// soundtrack when it has one, or a soundtrack alone. The model reads the references in the order given.
+struct Reference {
+    enum class Kind { image, video, audio };
+    Kind kind = Kind::image;
+    Image image;                                // image
+    uint32_t frames = 0, width = 0, height = 0; // video: [frames][height][width][3] at `fps`
+    double fps = 24.0;
+    std::vector<uint8_t> rgb;
+    std::vector<float> audio; // audio, or a video's soundtrack: [channels][samples] in [-1, 1]
+    uint32_t channels = 0, sample_rate = 0;
+    bool has_audio() const { return channels > 0 && !audio.empty(); }
 };
 
 // MiniMax-H3 from its original files (a directory with model_index.json, text_encoder/, tokenizer/, transformer/,
@@ -75,6 +90,11 @@ public:
         // Instead of the seed's: the noise mixed into each keyframe's latents ([latent_h][latent_w][24], first then
         // last).
         std::vector<std::span<const float>> keyframe_noise;
+        // ref2va: the references, in reading order (not together with keyframes; wants the Ref2VA transformer).
+        std::vector<Reference> references;
+        // Instead of the seed's: the noise mixed into each picture's or video's latents ([latent frames][latent_h]
+        // [latent_w][24] of its own grid, in order).
+        std::vector<std::span<const float>> reference_noise;
         float video_shift = kVideoShift, audio_shift = kAudioShift;
         std::function<void(uint32_t step, uint32_t steps)> progress;
     };
@@ -83,9 +103,24 @@ public:
     struct Latents {
         uint32_t width = 0, height = 0, frames = 0; // pixels and frames of the video
         uint32_t latent_frames = 0, latent_h = 0, latent_w = 0, audio_latents = 0;
-        uint32_t condition_rows = 0; // leading video rows that are keyframe conditioning, not decoded
+        uint32_t condition_rows = 0;       // leading video rows that are conditioning (keyframes, references), not decoded
+        uint32_t condition_audio_rows = 0; // leading audio rows that are references', not decoded
         std::vector<float> video, audio;
     };
+    // A reference picture as the released pipeline encodes it: its short edge to `short_edge` (2048), both sides
+    // rounded to multiples of 32 (Lanczos).
+    static Image normalize_reference_image(const Image& img, uint32_t short_edge = 2048);
+    // A reference video onto 24 fps (each frame held until the next one's slot), truncated to `frames`, on the canvas
+    // of its own aspect ratio (Lanczos).
+    static void normalize_reference_video(Reference& r, uint32_t frames);
+    // A soundtrack truncated to `frames` / 24 seconds at its own rate, upmixed to stereo, at 32 kHz: [2][samples].
+    static std::vector<float> normalize_reference_audio(const Reference& r, uint32_t frames);
+    // The frames the conditioner samples from a reference video (2 a second: every 12th) and the timestamp of every
+    // pair of them (the mean of theirs; the last frame repeated to fill a pair).
+    static void sample_frames(uint32_t frames, std::vector<uint32_t>& indices, std::vector<double>& stamps);
+    // The size the video processor puts n sampled frames of h x w on: multiples of 32, the pairs' pixels in all (n
+    // rounded to even, times the frame's) kept within 4096 and 25165824.
+    static std::pair<uint32_t, uint32_t> vision_video_size(uint32_t n, uint32_t h, uint32_t w);
     // A keyframe onto the canvas as the released pipeline puts it: the first stretched (Lanczos), another scaled to
     // cover the canvas and cropped at the centre.
     static Image prepare_keyframe(const Image& img, uint32_t width, uint32_t height, bool first);
@@ -110,6 +145,11 @@ public:
     // the prompt; `tags` gets each token's modality (text, or video for a vision block's).
     std::vector<float> prompt_embeddings(const std::string& prompt, std::span<const Image> keyframes = {},
                                          std::vector<uint8_t>* tags = nullptr);
+    // The same for a prompt with references (normalized): in reading order, "<Audio j>: " for a soundtrack, "<Picture
+    // i>: " and a vision block for a picture, "<Video k>: " and a timestamped vision block per sampled frame pair for
+    // a video; then the prompt.
+    std::vector<float> reference_embeddings(const std::string& prompt, std::span<const Reference> refs,
+                                            std::vector<uint8_t>* tags = nullptr, std::vector<int32_t>* ids = nullptr);
     const text::Tokenizer& tokenizer() const { return *tok_; }
     // The parts, each loaded on first use (the text encoder kept with Options::keep_text_encoder).
     H3& transformer();
@@ -137,6 +177,13 @@ private:
     std::vector<Lora> loras_; // to merge when the transformer loads
     std::unique_ptr<VideoVae> vae_;
     std::unique_ptr<AudioVae> avae_;
+    // A vision block (start, the merged tokens' pads, end) appended to a presentation, its rows tagged as video.
+    models::QwenText::Vision vision_block(std::vector<int32_t>& ids, std::vector<uint8_t>& tg,
+                                          const models::QwenVision::Features& f, const char* pad);
+    // The presentation's ids and vision blocks (their features in order) through the text encoder.
+    std::vector<float> encode_presentation(const std::string& prompt, std::vector<int32_t>& ids, std::vector<uint8_t>& tg,
+                                           std::vector<models::QwenText::Vision> blocks,
+                                           const std::vector<models::QwenVision::Features>& feats);
 };
 
 } // namespace mako::video

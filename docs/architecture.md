@@ -18,7 +18,7 @@ decoders.
 
 ## The packed sequence
 
-One request is one sequence of rows 5376 wide: `[text | (keyframe conditions) | audio | video]`.
+One request is one sequence of rows 5376 wide: `[text | (keyframe conditions or reference blocks) | audio | video]`.
 
 - Text: the prompt's tokens (no template, no special tokens around it), each row the text encoder's 50th hidden state
   through `condition_proj` (5120 -> 5376) and a two-block token refiner (plain pre-norm blocks, no rotary positions),
@@ -38,8 +38,9 @@ two ends of the width axis. 16 frequencies an axis of base 10000; 96 of each hea
 with the second 48).
 
 Each row carries a modality tag (0 video, 1 text, 2 audio) and a noise level: the generated video rows and the text
-take the video schedule's, the audio rows the audio schedule's, keyframe conditioning rows 0.999 (fl2va, not built
-yet). Rows at different levels run in one forward.
+take the video schedule's, the generated audio rows the audio schedule's, conditioning video rows (keyframes,
+reference pictures and videos) 0.999, reference audio rows 1 (clean). Rows at different levels run in one forward.
+`H3::rows` lays a layout out (positions, tags, roles, and the segments of video and audio rows in sequence order).
 
 ## A step
 
@@ -131,7 +132,7 @@ of a 768p forward, 55-60% dense.
 
 ## Not built yet
 
-References (ref2va, the other transformer and its video and audio references), a server.
+A server (mako-image's residency pattern).
 
 ## First and last frame conditioning (fl2va)
 
@@ -159,4 +160,55 @@ pixel-exact against PIL (worst 1 of 255), the VAE encoder's posterior to 7e-4 to
 tokens to 1.4e-3, the text embeddings with the keyframes to 7.6e-4, the transformer's velocities with the
 conditioning rows to 1e-2, and the engine end to end to 5e-2 on the final video rows (the same regime as text to
 video's 4.6e-2).
+
+## References (ref2va)
+
+The Ref2VA transformer (the same architecture and config as FL2VA's, other weights, its own turbo LoRAs) reads
+pictures, videos and soundtracks ahead of the generated rows. `Engine::Request::references`, in reading order; the
+CLI's `--ref-image`, `--ref-video`, `--ref-audio`.
+
+Normalization, as the released pipeline's setup step: a picture to a 2048 short edge, both sides rounded to multiples
+of 32 (Lanczos, PIL's arithmetic); a video onto 24 fps by holding each frame until the next one's slot (`floor(i *
+24 / fps + 0.5)`), cut to the generation's frame count, on the canvas its own aspect ratio resolves to (the same rule
+as the target's); a soundtrack cut to the generation's length at its own rate, mono repeated to stereo, resampled to
+32 kHz with torchaudio's windowed-sinc kernel (`resample`, lowpass width 6, rolloff 0.99, the kernel in float).
+Files are read with AVFoundation (`read_media`: BGRA frames with the track's rotation applied, float PCM at the
+source rate).
+
+The presentation, in reading order: `"<Audio j>: "` for every reference that carries sound (a soundtrack never
+reaches the conditioner, the label is all it gets); `"<Picture i>: "` and a vision block for a picture (the whole
+2048-short-edge picture through the tower: 64 x 64 merged tokens for a square one); `"<Video k>: "` and, per pair of
+sampled frames, `"<t seconds>"` and a vision block for a video (the frames sampled at 2 fps, every 12th; the pair's
+label its two timestamps' mean, rendered with round-half-to-even so the first pair of a 24 fps clip is `0.2`; the last
+frame repeated to fill a pair; the pairs put on the video processor's size, multiples of 32 keeping all the pairs'
+pixels within 4096 and 25165824, with torch's antialiased bicubic on 8-bit frames, 16-bit weights and all, so the
+resize is bit-exact). The vision tower takes a pair as one time-tap pair (`QwenVision::encode(first, second, ...)`),
+each pair attending only itself as Qwen3-VL does, and the text encoder treats each pair's pad run as an image for its
+rotary positions and DeepStack features. Then the prompt verbatim.
+
+The sequence (`H3::Layout::refs`): after the text, the reference blocks in reading order, each on the shared rotary
+clock that starts at the text's length: a picture's rows at one time slot (its own latent grid's spatial positions,
+the clock advancing one unit); a soundtrack's rows at a slot a latent (channel-major, the width axis at the two ends
+of the width grid of the block it belongs to: the target's for a soundtrack on its own, the video's for a video's)
+advancing the clock by its latent count; a video's soundtrack rows then its video rows, both from the same origin,
+the video's frames spaced 5/3 x (1, 4, 4, 4, 4) as the target's, the clock advancing by the larger of the two spans.
+Then the generated audio and video rows from where the clock ends. Picture and video rows are the VAE's latents
+noised to t = 0.999 (the posterior sampled under seed 42 as for keyframes; a video through the causal 3D encoder:
+17-frame clips with the time taps, time stride 2 at two levels, GroupNorm per frame, the frames padded by repeating
+the last one and the last three latents dropped, the frame count first snapped down to 17 n + 5); soundtrack rows are
+the audio VAE encoder's posterior mean (DAC encoder, the causal-attention projection block, `mean_proj`), clean, held
+at t = 1. The heads read the generated rows only; Euler updates them only.
+
+Checked against the reference dump's ref2va stage (a 400x400 picture encoded at a 1024 short edge, a 1 s stereo
+tone, a 22-frame 320x320 video with a 0.92 s soundtrack onto a 768x768 canvas; 256x256 target, 2 steps): the layout's
+positions to 3e-12 and tags exactly, the audio VAE encoder to 7e-6, the picture's posterior to 3e-3 and the video's
+to 1.2e-3, the vision tower on the picture and the frame pair to 1.6e-3, the presentation's token ids exactly and the
+text embeddings to 1.2e-2 (a few of the picture's 1024 pad rows reach cosine 0.96; the keyframe case, with 64-token
+blocks, sits at 7.6e-4), the transformer's generated-row velocities to 1.1e-2 (video) and 5e-3 (audio) at both steps
+with blocks 0 to 24 at 1.5e-3 over every row. In the last block and the final norm, the text and reference video
+rows, which no head reads, drift in BF16: at the second step 253 text rows and 360 reference video rows fall under
+cosine 0.99 against the fp32 reference (some to 0), while the generated rows stay within 4e-2 / 6e-2. The engine end
+to end from the raw references (its own normalization, presentation, VAE encodes and two steps) lands at 3.0e-2 on
+the final video rows and 1.3e-2 on the audio rows, the reference rows at 2e-3 and 5e-6. The ports of torchvision's
+bicubic and torchaudio's resampler are checked separately (`ports`: bit-exact, 2.5e-6).
 

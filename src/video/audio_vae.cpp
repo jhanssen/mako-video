@@ -38,7 +38,7 @@ safetensors::Files open_files(const std::string& path)
 } // namespace
 
 AudioVae::AudioVae(const std::string& dir, mtl::Context& ctx, gpu::Telemetry telemetry)
-    : TransformerRuntime(ctx, telemetry)
+    : TransformerRuntime(ctx, telemetry), dir_(dir)
 {
     {
         std::ifstream in(dir + "/config.json", std::ios::binary);
@@ -250,6 +250,241 @@ std::vector<float> AudioVae::decode(std::span<const float> rows, uint32_t n)
             wav[uint64_t(ch) * n * kHop + i] = std::clamp(o[i], -1.0f, 1.0f);
     }
     return wav;
+}
+
+AudioVae::Tensor AudioVae::load_alpha(const safetensors::Files& f, const std::string& name)
+{
+    const auto v = floats(f, name); // Snake1d's alpha, [1][channels][1], used as it is
+    Tensor t = reserve(v.size() * 4, gguf::Type::F32, {v.size()});
+    std::memcpy(static_cast<char*>(t.buf->contents()) + t.off, v.data(), v.size() * 4);
+    return t;
+}
+
+void AudioVae::load_encoder()
+{
+    if (enc_)
+        return;
+    const auto f = open_files(dir_ + "/model.safetensors");
+    static constexpr uint32_t kStrides[5] = {2, 4, 4, 5, 5}, kDil[3] = {1, 3, 9};
+    auto e = std::make_unique<Encoder>();
+    e->in = load_conv(f, "encoder.block.0", 7, 1, 3, 1, false, true);
+    uint32_t ch = 64;
+    for (uint32_t i = 0; i < 5; ++i) {
+        EncBlock& B = e->blocks[i];
+        const std::string p = std::format("encoder.block.{}.block.", i + 1);
+        for (uint32_t j = 0; j < 3; ++j) {
+            EncUnit& u = B.units[j];
+            const std::string q = std::format("{}{}.block.", p, j);
+            u.a1 = load_alpha(f, q + "0.alpha");
+            u.c1 = load_conv(f, q + "1", 7, 1, 3 * kDil[j], kDil[j], false, true);
+            u.a2 = load_alpha(f, q + "2.alpha");
+            u.c2 = load_conv(f, q + "3", 1, 1, 0, 1, false, true);
+            if (u.c1.cin != ch || u.c2.cout != ch)
+                throw std::runtime_error(q + ": unexpected channels");
+        }
+        B.act = load_alpha(f, p + "3.alpha");
+        const uint32_t s_ = kStrides[i];
+        B.down = load_conv(f, p + "4", 2 * s_, s_, (s_ + 1) / 2, 1, false, true);
+        if (B.down.cin != ch || B.down.cout != 2 * ch)
+            throw std::runtime_error(p + "4: unexpected channels");
+        ch *= 2;
+    }
+    e->act_out = load_alpha(f, "encoder.block.6.alpha");
+    e->out = load_conv(f, "encoder.block.7", 3, 1, 1, 1, false, true);
+    if (e->out.cin != kLatentDim || e->out.cout != kLatentDim)
+        throw std::runtime_error("audio VAE: the encoder does not end in 2048 channels");
+    auto vec = [&](const std::string& n) { return floats(f, n); };
+    e->ln1_w = vec("pre_block.norm1.weight");
+    e->ln1_b = vec("pre_block.norm1.bias");
+    e->ln3_w = vec("pre_block.norm3.weight");
+    e->ln3_b = vec("pre_block.norm3.bias");
+    e->ln2_w = vec("pre_block.norm2.weight");
+    e->ln2_b = vec("pre_block.norm2.bias");
+    e->lnm_w = vec("pre_block.mlp.norm.weight");
+    e->lnm_b = vec("pre_block.mlp.norm.bias");
+    e->qkv = vec("pre_block.attn.qkv.weight");
+    e->q_bias = vec("pre_block.attn.q_bias");
+    e->v_bias = vec("pre_block.attn.v_bias");
+    e->attn_proj_w = vec("pre_block.attn.proj.weight");
+    e->attn_proj_b = vec("pre_block.attn.proj.bias");
+    e->proj_w = vec("pre_block.proj.weight");
+    e->proj_b = vec("pre_block.proj.bias");
+    e->w0 = vec("pre_block.mlp.w0.weight");
+    e->w0_b = vec("pre_block.mlp.w0.bias");
+    e->w1 = vec("pre_block.mlp.w1.weight");
+    e->w1_b = vec("pre_block.mlp.w1.bias");
+    e->w2 = vec("pre_block.mlp.w2.weight");
+    e->w2_b = vec("pre_block.mlp.w2.bias");
+    e->mean_w = vec("mean_proj.weight");
+    e->mean_b = vec("mean_proj.bias");
+    if (e->qkv.size() != uint64_t(3) * kLatentDim * kLatentDim || e->proj_w.size() != uint64_t(kChannels) * kLatentDim ||
+        e->mean_w.size() != kChannels * kChannels || e->w0.size() != 64 * kChannels)
+        throw std::runtime_error("audio VAE: the projection block's shapes are not the expected ones");
+    enc_ = std::move(e);
+    log::info("audio VAE encoder loaded ({:.0f} MB resident in all)", double(dense_bytes_) / 1e6);
+}
+
+void AudioVae::encode_channel(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, uint32_t samples, MTL::Buffer* out)
+{
+    // Channels x time throughout; three scratch buffers of the widest layer (64 channels at full rate).
+    const uint64_t cap = uint64_t(64) * samples * 4;
+    MTL::Buffer* h = scratch("e_h", cap);
+    MTL::Buffer* t1 = scratch("e_t1", cap);
+    MTL::Buffer* t2 = scratch("e_t2", cap);
+    auto snake = [&](MTL::Buffer* b, const Tensor& alpha, uint32_t channels, uint32_t t) {
+        dispatch_at(enc, "snake_beta", {b, alpha, alpha}, &t, sizeof(t), MTL::Size(t, channels, 1), MTL::Size(64, 1, 1));
+    };
+    uint32_t t = samples, ch = 64;
+    conv(enc, enc_->in, x, samples, h, t);
+    for (const EncBlock& B : enc_->blocks) {
+        for (const EncUnit& u : B.units) {
+            // y = c2(snake(c1(snake(h)))); h += y
+            const uint32_t count = ch * t;
+            dispatch_at(enc, "copy_f32", {h, t1}, &count, sizeof(count), MTL::Size(count, 1, 1), MTL::Size(256, 1, 1));
+            snake(t1, u.a1, ch, t);
+            conv(enc, u.c1, t1, t, t2, t);
+            snake(t2, u.a2, ch, t);
+            conv(enc, u.c2, t2, t, t1, t);
+            add(enc, h, t1, h, ch * t);
+        }
+        snake(h, B.act, ch, t);
+        const uint32_t tout = (t + 2 * B.down.pad - B.down.k) / B.down.stride + 1;
+        conv(enc, B.down, h, t, t1, tout);
+        std::swap(h, t1);
+        t = tout;
+        ch *= 2;
+    }
+    snake(h, enc_->act_out, ch, t);
+    conv(enc, enc_->out, h, t, out, t);
+}
+
+std::vector<float> AudioVae::encode(std::span<const float> left, std::span<const float> right)
+{
+    if (left.empty() || left.size() != right.size())
+        throw std::runtime_error("audio VAE: a stereo waveform, both channels of the same length");
+    load_encoder();
+    const uint32_t samples = uint32_t((left.size() + kHop - 1) / kHop * kHop), n = samples / kHop, D = kLatentDim;
+    MTL::Buffer* x = scratch("e_x", uint64_t(samples) * 4);
+    MTL::Buffer* out = scratch("e_out", uint64_t(D) * n * 4);
+    std::vector<float> feats(uint64_t(2) * n * D); // [channel][n][2048]
+    for (uint32_t ch = 0; ch < 2; ++ch) {
+        auto* xf = static_cast<float*>(x->contents());
+        std::fill_n(xf, samples, 0.0f);
+        const auto& w = ch ? right : left;
+        std::copy(w.begin(), w.end(), xf);
+        MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
+        cur_cb_ = cb;
+        MTL::ComputeCommandEncoder* enc = encoder(cb, 0, -1);
+        encode_channel(enc, x, samples, out);
+        enc->endEncoding();
+        finish(cb);
+        const auto* o = static_cast<const float*>(out->contents()); // [2048][n]
+        for (uint32_t c = 0; c < D; ++c)
+            for (uint32_t t = 0; t < n; ++t)
+                feats[(uint64_t(ch) * n + t) * D + c] = o[uint64_t(c) * n + t];
+    }
+    // The projection block on the CPU: h = proj(LN3(x)) + attn(LN1(x)); h += mlp(LN2(h)); then mean_proj.
+    const Encoder& E = *enc_;
+    auto layer_norm = [](std::span<const float> x, const std::vector<float>& w, const std::vector<float>& b,
+                         std::vector<float>& y, uint32_t n_) {
+        for (uint32_t i = 0; i < n_; ++i) {
+            double mean = 0, var = 0;
+            for (uint32_t c = 0; c < w.size(); ++c)
+                mean += x[uint64_t(i) * w.size() + c];
+            mean /= double(w.size());
+            for (uint32_t c = 0; c < w.size(); ++c) {
+                const double d = x[uint64_t(i) * w.size() + c] - mean;
+                var += d * d;
+            }
+            const double inv = 1.0 / std::sqrt(var / double(w.size()) + 1e-5);
+            for (uint32_t c = 0; c < w.size(); ++c)
+                y[uint64_t(i) * w.size() + c] = float((x[uint64_t(i) * w.size() + c] - mean) * inv) * w[c] + b[c];
+        }
+    };
+    auto linear = [](std::span<const float> x, uint32_t n_, uint32_t in, const std::vector<float>& w,
+                     const std::vector<float>* b, uint32_t outd, std::vector<float>& y) { // w [outd][in]
+        y.assign(uint64_t(n_) * outd, 0.0f);
+        for (uint32_t i = 0; i < n_; ++i)
+            for (uint32_t o = 0; o < outd; ++o) {
+                double s = b ? (*b)[o] : 0.0;
+                const float* xr = &x[uint64_t(i) * in];
+                const float* wr = &w[uint64_t(o) * in];
+                for (uint32_t c = 0; c < in; ++c)
+                    s += double(xr[c]) * wr[c];
+                y[uint64_t(i) * outd + o] = float(s);
+            }
+    };
+    constexpr uint32_t kHeads = 8, kHd = kLatentDim / kHeads; // 256
+    std::vector<float> rows(uint64_t(2) * n * kChannels);
+    std::vector<float> ln(uint64_t(n) * D), qkv, direct, attn_out(uint64_t(n) * kHd), pooled(uint64_t(n) * kChannels),
+        h, ln2, mlp0, mlp1, mlp2, mean;
+    for (uint32_t ch = 0; ch < 2; ++ch) {
+        const std::span<const float> xch(&feats[uint64_t(ch) * n * D], uint64_t(n) * D);
+        // The direct path.
+        layer_norm(xch, E.ln3_w, E.ln3_b, ln, n);
+        linear(ln, n, D, E.proj_w, &E.proj_b, kChannels, direct);
+        // The causal attention: 8 heads of 256, the outputs averaged over the heads and then pooled 8 to 1 onto 32.
+        layer_norm(xch, E.ln1_w, E.ln1_b, ln, n);
+        linear(ln, n, D, E.qkv, nullptr, 3 * D, qkv);
+        std::fill(attn_out.begin(), attn_out.end(), 0.0f);
+        const float scale = 1.0f / std::sqrt(float(kHd));
+        std::vector<double> sc(n);
+        for (uint32_t hh = 0; hh < kHeads; ++hh)
+            for (uint32_t i = 0; i < n; ++i) {
+                const float* q = &qkv[uint64_t(i) * 3 * D + hh * kHd];
+                double mx = -1e300;
+                for (uint32_t j = 0; j <= i; ++j) {
+                    const float* k = &qkv[uint64_t(j) * 3 * D + D + hh * kHd];
+                    double s = 0;
+                    for (uint32_t d = 0; d < kHd; ++d)
+                        s += double(q[d] + E.q_bias[hh * kHd + d]) * k[d]; // k's bias is zero
+                    sc[j] = s * scale;
+                    mx = std::max(mx, sc[j]);
+                }
+                double sum = 0;
+                for (uint32_t j = 0; j <= i; ++j) {
+                    sc[j] = std::exp(sc[j] - mx);
+                    sum += sc[j];
+                }
+                float* o = &attn_out[uint64_t(i) * kHd];
+                for (uint32_t j = 0; j <= i; ++j) {
+                    const float* v = &qkv[uint64_t(j) * 3 * D + 2 * D + hh * kHd];
+                    const float wgt = float(sc[j] / sum);
+                    for (uint32_t d = 0; d < kHd; ++d)
+                        o[d] += wgt * (v[d] + E.v_bias[hh * kHd + d]) / float(kHeads);
+                }
+            }
+        for (uint32_t i = 0; i < n; ++i)
+            for (uint32_t c = 0; c < kChannels; ++c) {
+                float s = 0.0f;
+                for (uint32_t d = 0; d < kHd / kChannels; ++d)
+                    s += attn_out[uint64_t(i) * kHd + c * (kHd / kChannels) + d];
+                pooled[uint64_t(i) * kChannels + c] = s / float(kHd / kChannels);
+            }
+        linear(pooled, n, kChannels, E.attn_proj_w, &E.attn_proj_b, kChannels, h);
+        for (uint64_t i = 0; i < h.size(); ++i)
+            h[i] += direct[i];
+        // The GeGLU MLP on LN2(h): w2(gelu_tanh(w0(LN(x))) * w1(LN(x))).
+        ln2.resize(h.size());
+        layer_norm(h, E.ln2_w, E.ln2_b, ln2, n);
+        std::vector<float> lnm(ln2.size());
+        layer_norm(ln2, E.lnm_w, E.lnm_b, lnm, n);
+        linear(lnm, n, kChannels, E.w0, &E.w0_b, 64, mlp0);
+        linear(lnm, n, kChannels, E.w1, &E.w1_b, 64, mlp1);
+        for (uint64_t i = 0; i < mlp0.size(); ++i) {
+            const float v = mlp0[i];
+            const float g = 0.5f * v * (1.0f + std::tanh(0.7978845608f * (v + 0.044715f * v * v * v)));
+            mlp0[i] = g * mlp1[i];
+        }
+        linear(mlp0, n, 64, E.w2, &E.w2_b, kChannels, mlp2);
+        for (uint64_t i = 0; i < h.size(); ++i)
+            h[i] += mlp2[i];
+        linear(h, n, kChannels, E.mean_w, &E.mean_b, kChannels, mean);
+        for (uint32_t t = 0; t < n; ++t)
+            for (uint32_t c = 0; c < kChannels; ++c)
+                rows[(uint64_t(ch) * n + t) * kChannels + c] = (mean[uint64_t(t) * kChannels + c] - mean_[c]) / std_[c];
+    }
+    return rows;
 }
 
 } // namespace mako::video

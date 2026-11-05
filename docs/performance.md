@@ -197,3 +197,13 @@ share; `h3_ref_test dit none RATIO`):
 | 0.25 | 3.8e-1 / 2.3e-1 |
 | 0.1 | 5.3e-1 / 2.7e-1 |
 
+## References (ref2va)
+
+References are rows: a picture at the released 2048 short edge enters twice, as its vision block in the text (a
+16:9 picture is 64 x 113 = 7232 tokens) and as its latents (another 7232 rows); a video goes on the canvas of its own
+aspect ratio whatever the target, so a 16:9 clip costs 1008 rows a latent frame (5 n + 2 of them for 17 n + 5 frames,
+a 1 s clip 7 frames) plus 1008 vision tokens per sampled frame pair (2 fps) and 80 audio rows a second. A 512x288
+generation (5328 video rows, 414 audio) with a 960x544 picture and a 1 s 512x288 clip with sound ran as a sequence of
+about 28.6k rows: 85-89 s a forward (the first 202 s, the vision tower and text encoder included), 8 steps with the
+ref2v turbo LoRA in 13.7 min end to end, the video decode 16 s. A 768p generation with a 16:9 video reference of its
+own length doubles the rows (37296 more) and so roughly quadruples the attention.

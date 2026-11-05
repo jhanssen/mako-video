@@ -283,6 +283,96 @@ void H3::block(MTL::ComputeCommandEncoder*& enc, const Block& B, MTL::Buffer* x,
     gated(5);
 }
 
+H3::Rows H3::rows(const Layout& l)
+{
+    Rows R;
+    const uint32_t T = l.text, S = l.rows();
+    R.pos.assign(uint64_t(S) * 3, 0.0);
+    R.tags.assign(S, kVideoTag);
+    R.roles.assign(S, kRoleVideo);
+    for (uint32_t i = 0; i < T; ++i) {
+        R.pos[uint64_t(i) * 3] = i;
+        R.tags[i] = l.text_tags.empty() ? kTextTag : l.text_tags[i];
+        R.roles[i] = kRoleText;
+    }
+    // One spatial axis of a block's grid (latent h x w): its n coordinates centred on the unit interval in the
+    // block's aspect ratio, times 32 (numpy's linspace without the endpoint).
+    auto grid = [](uint32_t h, uint32_t w, uint32_t dim, uint32_t n, uint32_t i) {
+        const double ratio = double(dim) / std::sqrt(double(h) * double(w)), left = (1.0 - ratio) / 2.0;
+        return (left + double(i) * (ratio / double(n))) * kSpatialScale;
+    };
+    auto span_of = [](uint32_t f) { return kFrameRescale * kFramesPerLatent[f % 5]; };
+    uint32_t cur = T, vsrc = 0, asrc = 0; // the next sequence row, and the next video / audio row step() takes
+    double clock = double(T);
+    // A block of video rows: frames x grid, from time t0, each frame its span later when `advance`.
+    auto video_block = [&](uint32_t frames, uint32_t h, uint32_t w, double t0, bool advance, uint8_t role) {
+        const uint32_t ph = h / 2, pw = w / 2;
+        R.segments.push_back({false, cur, frames * ph * pw, vsrc});
+        double t = t0;
+        for (uint32_t f = 0; f < frames; ++f) {
+            for (uint32_t y = 0; y < ph; ++y)
+                for (uint32_t x = 0; x < pw; ++x) {
+                    double* p = &R.pos[uint64_t(cur) * 3];
+                    p[0] = t;
+                    p[1] = grid(h, w, h, ph, y);
+                    p[2] = grid(h, w, w, pw, x);
+                    R.roles[cur++] = role;
+                    ++vsrc;
+                }
+            if (advance)
+                t += span_of(f);
+        }
+    };
+    // A block of audio rows, channel-major: a latent a time unit from t0, no height, the width axis at the two
+    // extremes of the width grid of the block it belongs to (its video's, or the generated video's).
+    auto audio_block = [&](uint32_t latents, uint32_t h, uint32_t w, double t0, uint8_t role) {
+        R.segments.push_back({true, cur, 2 * latents, asrc});
+        const uint32_t pw = w / 2;
+        for (uint32_t ch = 0; ch < 2; ++ch)
+            for (uint32_t j = 0; j < latents; ++j) {
+                double* p = &R.pos[uint64_t(cur) * 3];
+                p[0] = t0 + double(j);
+                p[2] = grid(h, w, w, pw, ch ? pw - 1 : 0);
+                R.tags[cur] = kAudioTag;
+                R.roles[cur++] = role;
+                ++asrc;
+            }
+    };
+    // Keyframes: at the first generated frame's time, or the last's.
+    double total = 0;
+    for (uint32_t f = 0; f < l.frames; ++f)
+        total += span_of(f);
+    for (uint32_t c = 0; c < l.cond_frames; ++c)
+        video_block(1, l.h, l.w, l.cond_last[c] ? clock + total - kFrameRescale : clock, false, kRoleCondVideo);
+    for (const Layout::Reference& r : l.refs) {
+        switch (r.kind) {
+        case Layout::Reference::Kind::image: // a single frame takes one integer slot, not a latent frame's 5/3
+            video_block(1, r.h, r.w, clock, false, kRoleCondVideo);
+            clock += 1.0;
+            break;
+        case Layout::Reference::Kind::audio:
+            audio_block(r.audio, l.h, l.w, clock, kRoleCondAudio);
+            clock += double(r.audio);
+            break;
+        case Layout::Reference::Kind::video: { // the soundtrack's rows right before the video's, sharing its origin
+            if (r.audio)
+                audio_block(r.audio, r.h, r.w, clock, kRoleCondAudio);
+            video_block(r.frames, r.h, r.w, clock, true, kRoleCondVideo);
+            double span = 0;
+            for (uint32_t f = 0; f < r.frames; ++f)
+                span += span_of(f);
+            clock += std::max(double(r.audio), span);
+            break;
+        }
+        }
+    }
+    audio_block(l.audio, l.h, l.w, clock, kRoleAudio);
+    video_block(l.frames, l.h, l.w, clock, true, kRoleVideo);
+    if (cur != S || vsrc != l.video_rows() || asrc != l.audio_rows())
+        throw std::logic_error("layout rows");
+    return R;
+}
+
 void H3::begin(std::span<const float> text, const Layout& l)
 {
     if (!l.text || text.size() != uint64_t(l.text) * kText)
@@ -293,6 +383,13 @@ void H3::begin(std::span<const float> text, const Layout& l)
         throw std::runtime_error("layout: a tag per text row");
     if (l.cond_last.size() != l.cond_frames)
         throw std::runtime_error("layout: an anchor per conditioning frame");
+    if (l.cond_frames && !l.refs.empty())
+        throw std::runtime_error("layout: keyframes and references do not go together");
+    for (const Layout::Reference& r : l.refs) {
+        const bool visual = r.kind != Layout::Reference::Kind::audio;
+        if (visual ? (!r.frames || !r.h || !r.w || r.h % 2 || r.w % 2) : !r.audio)
+            throw std::runtime_error("layout: a reference needs latent frames and an even grid, or audio latents");
+    }
     layout_ = l;
     cond_rows_ = l.cond_rows();
     S_ = l.rows();
@@ -313,62 +410,9 @@ void H3::begin(std::span<const float> text, const Layout& l)
     enc->endEncoding();
     finish(cb);
 
-    // Tags and rotary positions of every row, (t, h, w) in double as the reference lays them out, the angles in
-    // float: the text on the time axis at its row index, the media rows continuing from there (audio one unit a
-    // latent, the video 5/3 x (1, 4, 4, 4, 4) units a latent frame), the spatial axes centred on the unit square
-    // times 32.
-    tags_.assign(S, kVideoTag);
-    for (uint32_t i = 0; i < T; ++i)
-        tags_[i] = l.text_tags.empty() ? kTextTag : l.text_tags[i];
+    rows_ = rows(l);
+    tags_.assign(rows_.tags.begin(), rows_.tags.end());
     const uint32_t A = l.audio_rows(), rpf = l.rows_per_frame(), ph = l.h / 2, pw = l.w / 2;
-    for (uint32_t i = 0; i < A; ++i)
-        tags_[T + cond_rows_ + i] = kAudioTag;
-    std::vector<double> pos(uint64_t(S) * 3, 0.0);
-    for (uint32_t i = 0; i < T; ++i)
-        pos[uint64_t(i) * 3] = i;
-    const double sqrt_area = std::sqrt(double(l.h) * double(l.w));
-    auto grid = [&](uint32_t dim, uint32_t n, uint32_t i) {
-        const double ratio = double(dim) / sqrt_area, left = (1.0 - ratio) / 2.0;
-        return (left + double(i) * (ratio / double(n))) * kSpatialScale;
-    };
-    std::vector<double> spans(l.frames);
-    for (uint32_t f = 0; f < l.frames; ++f)
-        spans[f] = kFrameRescale * kFramesPerLatent[f % 5];
-    const double origin = double(T);
-    // Keyframe anchors: the first generated frame's time, or the last's.
-    for (uint32_t c = 0; c < l.cond_frames; ++c) {
-        double t = origin;
-        if (l.cond_last[c]) {
-            double sum = 0;
-            for (double s : spans)
-                sum += s;
-            t = origin + sum - kFrameRescale;
-        }
-        for (uint32_t y = 0; y < ph; ++y)
-            for (uint32_t x = 0; x < pw; ++x) {
-                double* p = &pos[(uint64_t(T) + c * rpf + y * pw + x) * 3];
-                p[0] = t;
-                p[1] = grid(l.h, ph, y);
-                p[2] = grid(l.w, pw, x);
-            }
-    }
-    for (uint32_t ch = 0; ch < 2; ++ch)
-        for (uint32_t j = 0; j < l.audio; ++j) {
-            double* p = &pos[(uint64_t(T) + cond_rows_ + ch * l.audio + j) * 3];
-            p[0] = origin + double(j);
-            p[2] = grid(l.w, pw, ch ? pw - 1 : 0);
-        }
-    double t = origin;
-    for (uint32_t f = 0; f < l.frames; ++f) {
-        for (uint32_t y = 0; y < ph; ++y)
-            for (uint32_t x = 0; x < pw; ++x) {
-                double* p = &pos[(uint64_t(T) + cond_rows_ + A + f * rpf + y * pw + x) * 3];
-                p[0] = t;
-                p[1] = grid(l.h, ph, y);
-                p[2] = grid(l.w, pw, x);
-            }
-        t += spans[f];
-    }
     // The sparse attention's cubes: the generated video rows in 4 x 4 x 4 cubes of (frame, patch row, patch column),
     // the grid padded to multiples of 4 with rows that are no token, then the text, conditioning and audio rows.
     cubes_ = {};
@@ -415,7 +459,7 @@ void H3::begin(std::span<const float> text, const Layout& l)
     for (uint32_t r = 0; r < S; ++r)
         for (uint32_t axis = 0; axis < 3; ++axis)
             for (uint32_t j = 0; j < kRopeFreqs; ++j) {
-                const float ang = float(pos[uint64_t(r) * 3 + axis]) * inv[j];
+                const float ang = float(rows_.pos[uint64_t(r) * 3 + axis]) * inv[j];
                 const uint64_t o = (uint64_t(r) * (kRot / 2) + axis * kRopeFreqs + j) * 2;
                 c[o] = std::cos(ang);
                 c[o + 1] = std::sin(ang);
@@ -437,6 +481,8 @@ H3::Velocity H3::step(std::span<const float> video, std::span<const float> audio
     std::vector<float> ts = {t_video, t_audio};
     if (C)
         ts.push_back(t_cond);
+    if (l.cond_audio_rows())
+        ts.push_back(kCondAudioT);
     std::ranges::sort(ts);
     ts.erase(std::unique(ts.begin(), ts.end()), ts.end());
     const uint32_t U = uint32_t(ts.size());
@@ -444,7 +490,9 @@ H3::Velocity H3::step(std::span<const float> video, std::span<const float> audio
     std::vector<uint32_t> off(S), off2(S);
     for (uint32_t r = 0; r < S; ++r) {
         const uint32_t tag = tags_[r];
-        const float t = r < T ? t_video : r < T + C ? t_cond : tag == kAudioTag ? t_audio : t_video;
+        const uint8_t role = rows_.roles[r];
+        const float t = role == kRoleCondVideo ? t_cond : role == kRoleCondAudio ? kCondAudioT
+                        : role == kRoleAudio ? t_audio : t_video;
         const uint32_t u = index(t);
         off[r] = u * kAdaln + tag * kModality;
         off2[r] = u * 2 * D;
@@ -529,15 +577,13 @@ H3::Velocity H3::step(std::span<const float> video, std::span<const float> audio
         bias(enc, fmods, final_adaln_b_, 2 * D, U);
     }
     probe(enc, "mod0", -1, mods, uint64_t(U) * kAdaln);
-    // The rows: [text | conditioning video | audio | video], the media through their patch projections.
-    if (C) {
-        proj(enc, video_in_, vin, 0, x, uint64_t(T) * D * 4, C);
-        bias(enc, x, video_in_b_, D, C, uint64_t(T) * D * 4);
+    // The media rows through their patch projections, segment by segment of the sequence.
+    for (const Segment& sg : rows_.segments) {
+        const Tensor& w = sg.audio ? audio_in_ : video_in_;
+        proj(enc, w, sg.audio ? ain : vin, uint64_t(sg.src) * (sg.audio ? kAudioChannels : kVideoPatch) * 4, x,
+             uint64_t(sg.row0) * D * 4, sg.n);
+        bias(enc, x, sg.audio ? audio_in_b_ : video_in_b_, D, sg.n, uint64_t(sg.row0) * D * 4);
     }
-    proj(enc, audio_in_, ain, 0, x, uint64_t(T + C) * D * 4, A);
-    bias(enc, x, audio_in_b_, D, A, uint64_t(T + C) * D * 4);
-    proj(enc, video_in_, vin, uint64_t(C) * kVideoPatch * 4, x, uint64_t(T + C + A) * D * 4, V - C);
-    bias(enc, x, video_in_b_, D, V - C, uint64_t(T + C + A) * D * 4);
     probe(enc, "x0", -1, x, uint64_t(S) * D);
     for (uint32_t b = 0; b < nb; ++b) {
         cur_layer_ = b;
@@ -557,8 +603,10 @@ H3::Velocity H3::step(std::span<const float> video, std::span<const float> audio
         after(enc, "rms_mod_rows");
     }
     probe(enc, "norm_out", -1, xn, uint64_t(S) * D);
-    proj(enc, video_out_, xn, uint64_t(T + C + A) * D * 4, vout, 0, V - C);
-    proj(enc, audio_out_, xn, uint64_t(T + C) * D * 4, aout, 0, A);
+    // The heads over the generated rows: the audio's then the video's, the sequence's last.
+    const uint32_t GV = V - C, GA = 2 * l.audio, gv0 = S - GV, ga0 = gv0 - GA;
+    proj(enc, video_out_, xn, uint64_t(gv0) * D * 4, vout, 0, GV);
+    proj(enc, audio_out_, xn, uint64_t(ga0) * D * 4, aout, 0, GA);
     enc->endEncoding();
     finish(cb);
     if (timing) {
@@ -576,7 +624,7 @@ H3::Velocity H3::step(std::span<const float> video, std::span<const float> audio
     // The heads' rows are padded to 256: the first 96 / 32 of each, plus the bias.
     Velocity v;
     v.video.assign(uint64_t(V) * kVideoPatch, 0.0f);
-    v.audio.resize(uint64_t(A) * kAudioChannels);
+    v.audio.assign(uint64_t(A) * kAudioChannels, 0.0f);
     const auto* vo = static_cast<const float*>(vout->contents());
     const auto* vb = reinterpret_cast<const float*>(static_cast<const char*>(video_out_b_.buf->contents()) +
                                                     video_out_b_.off);
@@ -586,9 +634,9 @@ H3::Velocity H3::step(std::span<const float> video, std::span<const float> audio
     const auto* ao = static_cast<const float*>(aout->contents());
     const auto* ab = reinterpret_cast<const float*>(static_cast<const char*>(audio_out_b_.buf->contents()) +
                                                     audio_out_b_.off);
-    for (uint32_t r = 0; r < A; ++r)
+    for (uint32_t r = 0; r < GA; ++r)
         for (uint32_t i = 0; i < kAudioChannels; ++i)
-            v.audio[uint64_t(r) * kAudioChannels + i] = ao[uint64_t(r) * kOutRows + i] + ab[i];
+            v.audio[uint64_t(A - GA + r) * kAudioChannels + i] = ao[uint64_t(r) * kOutRows + i] + ab[i];
     return v;
 }
 
