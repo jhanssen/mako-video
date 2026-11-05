@@ -70,6 +70,7 @@ int main(int argc, char** argv)
     bool keep_text = false;
     uint32_t int8 = 0;
     double sparse = 0;
+    uint32_t sparse_local = 1;
     std::vector<mako::video::Lora> loras;
     mako::app::Cli cli("mako_video", "<model dir> <prompt>", 2, 2);
     cli.option("-o", "FILE", "the MP4 to write (default video.mp4)", out)
@@ -103,6 +104,7 @@ int main(int argc, char** argv)
                     int8 = *m;
                 })
         .option("--sparse", "RATIO", "sparse attention over the video: the share of 4x4x4 cubes each cube attends, e.g. 0.1 (default 0: dense)", sparse)
+        .option("--sparse-local", "N", "with --sparse: cubes every cube keeps regardless of score: 0 none, 1 itself (default), 3 with its temporal neighbours", sparse_local)
         .option("--llm", "URL", "a mako_serve on this machine to borrow memory from", llm)
         .option("--llm-api-key", "KEY", "the key that mako_serve wants", llm_key)
         .secret();
@@ -125,7 +127,7 @@ int main(int argc, char** argv)
         mako::mtl::Context ctx;
         mako::video::Engine engine(pos[0], ctx, {.text_encoder = text_encoder, .transformer = transformer,
                                                  .keep_text_encoder = keep_text, .telemetry = telemetry, .int8 = int8,
-                                                 .sparse = float(sparse)});
+                                                 .sparse = float(sparse), .sparse_local = sparse_local});
         for (const auto& l : loras)
             engine.add_lora(l);
         mako::video::Engine::Request r;

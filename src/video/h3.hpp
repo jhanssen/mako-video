@@ -32,7 +32,13 @@ public:
     // in 64-row cubes of 4 latent frames x 4 x 4 patches, each cube's queries attending the share `ratio` of the
     // cubes a coarse pass over the cubes' mean q and k picks per head (at least one), and the text, conditioning and
     // audio rows; those rows' queries attend everything. 0: dense attention. Takes effect at the next begin().
-    void set_sparse(float ratio) { sparse_ = ratio; }
+    // local: the cubes every query cube keeps regardless of score: 0 none, 1 itself, 3 itself and the two a frame
+    // group before and after it.
+    void set_sparse(float ratio, uint32_t local = 1)
+    {
+        sparse_ = ratio;
+        sparse_local_ = local;
+    }
     float sparse() const { return sparse_; }
     static constexpr uint32_t kCube = 4; // latent frames, patch rows and patch columns of a cube
 
@@ -113,8 +119,10 @@ private:
     // Sparse attention: the attention's own row order [video cubes (padded) | text | conditions | audio], as a map
     // from its rows to the model's (-1: a padding row), each cube's valid rows, the dense rows' range.
     float sparse_ = 0.0f;
+    uint32_t sparse_local_ = 1;
     struct Cubes {
         uint32_t n = 0, rows = 0, topk = 0, dense0 = 0, dense1 = 0; // cubes; rows in the attention's order
+        uint32_t stride = 0;                                        // cubes a frame group apart
         MTL::Buffer *map = nullptr, *valid = nullptr, *cnt = nullptr;
     } cubes_;
 };

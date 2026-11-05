@@ -106,7 +106,7 @@ H3& Engine::transformer()
         dit_ = std::make_unique<H3>(opts_.transformer.empty() ? dir_ + "/transformer" : opts_.transformer, ctx_,
                                     opts_.telemetry, opts_.int8);
         log::info("transformer loaded in {:.1f} s", seconds_since(t0));
-        dit_->set_sparse(opts_.sparse);
+        dit_->set_sparse(opts_.sparse, opts_.sparse_local);
         for (const Lora& l : loras_)
             dit_->add_lora(l.path, l.scale, true);
     }

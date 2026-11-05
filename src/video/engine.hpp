@@ -26,6 +26,7 @@ struct Options {
     gpu::Telemetry telemetry = gpu::Telemetry::off;
     uint32_t int8 = 0; // H3::Int8: the transformer blocks' matrices kept as int8
     float sparse = 0;  // H3::set_sparse: the share of video cubes each cube attends (0: dense attention)
+    uint32_t sparse_local = 1; // the cubes kept regardless of score: 0 none, 1 the cube itself, 3 with its neighbours
 };
 
 // A LoRA file and its scale, merged into the transformer's weights.

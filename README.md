@@ -65,8 +65,10 @@ fl2v one and serves both.
 `--sparse RATIO` turns on block-sparse attention over the video rows: they are grouped into 4x4x4 cubes of latent
 frames and patches, and each cube's queries attend only the share RATIO of the cubes that a coarse pass over the
 cubes' mean queries and keys ranks highest for that head (plus the text, keyframe and audio rows). 0.1 is the setting
-the H3 Eros Max merge was tuned for; it is an approximation of the model's dense attention, so expect some change in
-detail. Default 0, dense.
+the H3 Eros Max merge was tuned for; it is an approximation of the model's dense attention: the result is a different
+sample of the same prompt, and its brightness drifts more over the clip than the dense model's. `--sparse-local N`
+keeps cubes regardless of score: 0 none, 1 the cube itself (default), 3 with its temporal neighbours. Default 0,
+dense. A 768p forward takes 56-58 s instead of 133 at ratio 0.1.
 
 `--transformer` also takes a single-file checkpoint, including the pruned ones (ComfyUI's `*_pruned_*` files and
 Civitai merges such as H3 Eros Max: 40 GB, the time embedder folded into an `adaln_t_table`), with the text encoder

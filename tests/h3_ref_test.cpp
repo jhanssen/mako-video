@@ -136,6 +136,8 @@ int main(int argc, char** argv)
     }
     if (argc > 5) // the sparse attention's share of cubes (1: every cube, which must give the dense result)
         opts.sparse = std::stof(argv[5]);
+    if (argc > 6) // the cubes kept regardless of score (0, 1 or 3)
+        opts.sparse_local = uint32_t(std::stoul(argv[6]));
     Engine engine(model.string(), ctx, opts);
 
     if (mode == "tokens") {

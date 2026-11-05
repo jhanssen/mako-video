@@ -17,7 +17,7 @@ Measured on an M5 Max (128 GB, 40-core GPU), the FL2VA checkpoint with the light
 | 1344x768, 124 frames (37296 video rows, 38 k in all): first forward | 145 s (was 149, before that 231) |
 | 1344x768, 124 frames: later forwards (thermal state "fair" throughout) | 125 s each (was 128, 173-179) |
 | Video decode, 1344x768 x 124 frames (7 clips of 4 x 7 tiles) | 69 s |
-| 1344x768, 124 frames, 8 forwards, end to end | about 18.5 min from the forward times (19 measured with the previous attention; 25.6 before the tiles) |
+| 1344x768, 124 frames, 8 forwards, end to end (measured, dense) | 19.2 min: 147 s, then 133 s a forward, 70 s decode |
 | 1344x768 with `--int8 all` (below): forwards | 129 s, then 110 s each (about 16.5 min end to end) |
 | 512x288, 124 frames, 9 steps: H3 Eros Max (pruned, distillation merged, no LoRA) / FL2VA + turbo LoRA | 77 s / 91-104 s end to end, 6.4-7.4 s a forward |
 | 512x288, 124 frames, 9 steps, FL2VA + turbo LoRA from a first frame (vision tower 0.4 s to load, VAE encoder, the keyframe rows in the sequence) | 101 s end to end, 6.9-8.6 s a forward after the first (30.7 s) |
@@ -158,3 +158,42 @@ middle frames). The error is mostly 8-bit resolution, not outlier channels: a sc
 activations brought `all` from 7.1e-2 to 5.9e-2 only (fc1 + fc2 alone 6.3 -> 3.8-4.4e-2) and its straightforward
 kernel ran at 13 TFLOP/s, so it was dropped (the note in gemm.metal says what a fast one would take). `--int8` is
 off by default.
+
+## Sparse attention (`--sparse`, Video Sparse Attention's training-free form)
+
+The generated video rows in 4x4x4 cubes of 64 tokens; per head and query cube, the top `ratio` share of cubes by the
+cubes' mean q and k; the text, keyframe and audio rows always attended; see architecture.md.
+
+| Forward, ratio 0.1 | dense | sparse |
+| --- | ---: | ---: |
+| 960x544 GPU time (nominal thermal state) | 34.4 s | 21.3 s |
+| of which attention (50 x) | 17.2 s | 4.7 s (+ 0.3 s selection) |
+| 960x544 wall, later forwards | 39-44 s | 22-27 s |
+| 1344x768 wall, later forwards | 133 s | 56-58 s |
+| 1344x768, 9 steps, end to end | 19.2 min | 9.2 min |
+
+The sparse attention's 4.7 s is more than a tenth of the dense 17.2: at 960x544 the 37 x 17 x 30 patch grid pads to
+40 x 20 x 32 in cubes (36% more query tiles), each cube also attends the 435 dense rows, and the dense rows' queries
+attend everything; the coarse selection (cube_pool, cube_scores, cube_topk) is 0.3 s a forward at 400 cubes. A flag
+that let all-valid passes skip the key mask measured no faster and was taken out.
+
+Keeping the query cube itself (`--sparse-local 1`, the default) or also its temporal neighbours (3) regardless of
+score changes the error at 256x256 little: at ratio 0.1, 5.3e-1 / 2.7e-1 (0), 4.9e-1 / 2.6e-1 (1), 4.6e-1 / 2.9e-1 (3).
+
+Rendered at 960x544 (9 steps, seed 7, the thermal state hot after an hour of runs: the dense forward 52 s there):
+FL2VA + turbo LoRA at ratio 0.1 is 32 s a forward, at 0.25 39 s; Eros Max at 0.1 35 s. All give a coherent fox of
+the dense renders' quality but a different sample (PSNR 11-14 dB between corresponding frames, as any perturbation of
+an 8-step denoise does), and the sparse clips' mean brightness drifts over the 124 frames (FL2VA 0.1: 93 to 64 and
+back to 77; Eros 0.1: 103 to 77) where the dense ones stay within 81-96.
+
+What it costs, as the velocity error against the dense reference at 256x256 (40 cubes, where each cube is a large
+share; `h3_ref_test dit none RATIO`):
+
+| ratio | video velocity rel error, step 0 / 1 |
+| --- | ---: |
+| 1 (every cube) | 0.8e-2 / 1.0e-2 (the dense kernel's 0.7e-2 / 1.2e-2) |
+| 0.9 | 6.8e-2 / 6.1e-2 |
+| 0.5 | 2.1e-1 / 1.8e-1 |
+| 0.25 | 3.8e-1 / 2.3e-1 |
+| 0.1 | 5.3e-1 / 2.7e-1 |
+

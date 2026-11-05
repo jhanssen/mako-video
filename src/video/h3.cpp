@@ -266,7 +266,8 @@ void H3::block(MTL::ComputeCommandEncoder*& enc, const Block& B, MTL::Buffer* x,
     }
     if (sparse) {
         MTL::Buffer *sel = nullptr, *nsel = nullptr;
-        cube_select(enc, qh, kh, kHeads, aq_pad, ak_pad, cubes_.n, cubes_.cnt, cubes_.topk, sel, nsel);
+        cube_select(enc, qh, kh, kHeads, aq_pad, ak_pad, cubes_.n, cubes_.cnt, cubes_.topk, sel, nsel, sparse_local_,
+                    cubes_.stride);
         attention_sparse(enc, qh, kh, vh, att, arows, aq_pad, arows, ak_pad, kHeads, kHeads, kHeads * 128, cubes_.n,
                          cubes_.topk, cubes_.dense0, cubes_.dense1, sel, nsel, cubes_.valid, map);
     } else {
@@ -382,6 +383,7 @@ void H3::begin(std::span<const float> text, const Layout& l)
         cubes_.dense0 = vrows;
         cubes_.dense1 = vrows + dense;
         const uint32_t q_pad = round_up(cubes_.rows, kAttnRows), k_pad = round_up(cubes_.rows, 128);
+        cubes_.stride = yc * xc;
         cubes_.map = scratch("k_map", uint64_t(q_pad) * 4);
         cubes_.valid = scratch("k_valid", k_pad);
         cubes_.cnt = scratch("k_cnt", uint64_t(n) * 4);

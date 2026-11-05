@@ -123,6 +123,8 @@ padding rows zero), a coarse pass pools each cube's queries and keys to their me
 and keeps the top `ratio` share of cubes per query cube (`cube_pool`, `cube_scores`, `cube_topk` in mako-common), and
 `flash_attn_sparse_128` runs the flash attention over a pass list: a cube's selected cubes and the dense rows, or
 everything for a dense row's queries; padding keys are masked, and the outputs are written back to the model's rows.
+`--sparse-local` puts the query cube itself (and with 3 the cubes a frame group before and after it) into the
+selection ahead of the scores.
 With `ratio` 1 every cube is selected and the result is the dense model's (h3_dit_sparse_all checks the velocities
 against the reference). Text-to-video with few video rows gains nothing; the cost that matters is attention's share
 of a 768p forward, 55-60% dense.
