@@ -18,6 +18,7 @@ Measured on an M5 Max (128 GB, 40-core GPU), the FL2VA checkpoint with the light
 | 1344x768, 124 frames: later forwards (thermal state "fair" throughout) | 125 s each (was 128, 173-179) |
 | Video decode, 1344x768 x 124 frames (7 clips of 4 x 7 tiles) | 69 s |
 | 1344x768, 124 frames, 8 forwards, end to end | about 18.5 min from the forward times (19 measured with the previous attention; 25.6 before the tiles) |
+| 1344x768 with `--int8 all` (below): forwards | 129 s, then 110 s each (about 16.5 min end to end) |
 
 The "was" numbers are from before the dense BF16 GEMM moved to 64 x 128 tiles and the attention to 64 keys a pass,
 then to the cooperative kernel (mako-common, below).
@@ -111,7 +112,47 @@ keys, the image models' text encoders): 2.2-2.3 ms against 2.3-3.0 for 16 x 32 (
 | bfloat or half, float | 65 |
 | int8, int32 | 127-130 |
 
-Twice the BF16 rate at every tile tried, so int8 GEMMs with per-row dynamic activation scales (the approach of
-antirez/h3.c, which reports 36.3 -> 19.3 s for a 19-forward 512x512 denoise from int8 MLP and QKV against BF16
-MPSGraph) would take the GEMMs' 32-38 s of a 768p forward towards 17-20 s, at a quantization cost not measured here.
-Not built.
+Twice the BF16 rate at every tile tried, which is what antirez/h3.c's int8 GEMMs rest on (it reports 36.3 -> 19.3 s
+for a 19-forward 512x512 denoise from int8 MLP and QKV against BF16 MPSGraph).
+
+## Int8 matrices (`--int8`)
+
+The transformer blocks' q / k / v, out, fc1 and fc2 matrices (any subset) quantized at load to int8 rows with a float
+scale each (symmetric, the row's maximum at 127), the activations quantized the same way per row before each
+projection (`quant_rows_i8`), the products summed in int32 by mako-common's `gemm_i8` (64 x 128 tiles over 4
+simdgroups, 128 deep a step) and scaled in the epilogue. LoRAs merge into the int8 rows by requantizing each row
+(`lora_merge_i8`). Weights: 66.3 GB -> 47.0 with all four (the AdaLN projections, 26 GB, stay BF16).
+
+| `dense_gemm_bench`, 19456 rows | BF16 64 x 128 | int8 64 x 128 | int8 128 x 128 (8 simdgroups) |
+| --- | ---: | ---: | ---: |
+| 14336 -> 5376 (fc2) | 52 ms, 57 TFLOP/s | 31 ms, 98 | 35 ms, 86 |
+| 5376 -> 28672 (fc1) | 98 ms, 61 | 62 ms, 96 | 71 ms, 84 |
+| 5376 -> 21504 (q, k, v) | 74 ms, 61 | 47 ms, 96 | 54 ms, 84 |
+| 7168 -> 5376 (out) | 25 ms, 60 | 16 ms, 96 | 18 ms, 84 |
+
+1.6-1.7x, not matmul2d's 2x: the epilogue's per-element scaling and the activation re-reads. 64 x 64 tiles run at
+72 TFLOP/s, so `Gemm::encode` keeps its tile policy (64 x 128 past 64 rows where n allows).
+
+| Forward, `--int8 all` | BF16 | int8 |
+| --- | ---: | ---: |
+| 960x544 GPU time, nominal / fair thermal state | 34.4 / 40.1 s | 28.3 / 33.5 s |
+| of which the four projections (+ quantization) | 15.8 / 19.0 s | 9.4 / 11.6 s (+ 0.3) |
+| 1344x768 forward, first / later | 145 / 125 s | 129 / 110 s |
+| 512x288, 9 steps, end to end | 104 s | 79 s |
+
+What it costs (`h3_ref_test dit all` against the fp32 reference, 256x256, 2 steps; BF16's own error first):
+
+| Matrices in int8 | video velocity rel error | audio velocity | block 49 |
+| --- | ---: | ---: | ---: |
+| none (BF16) | 0.7-1.2e-2 | 0.2-0.3e-2 | 1.2-2.5e-2 |
+| out | 3.5-3.6e-2 | 0.6-1.0e-2 | 3.8-7.9e-2 |
+| qkv | 5.1e-2 | 1.1-1.5e-2 | 5.8e-2-1.1e-1 |
+| fc1, fc2 | 6.2-6.3e-2 | 1.9-2.5e-2 | 7.9e-2-1.3e-1 |
+| all | 7.1e-2 | 2.1-3.3e-2 | 9.0e-2-1.5e-1 |
+
+Five to six times BF16's deviation, which the 8-step denoise turns into a different sample: the same prompt and seed
+at 512x288 gives a fox of the same look in a different pose and lighting (PSNR 17 dB between the BF16 and int8
+middle frames). The error is mostly 8-bit resolution, not outlier channels: a scale per 128-wide group of the
+activations brought `all` from 7.1e-2 to 5.9e-2 only (fc1 + fc2 alone 6.3 -> 3.8-4.4e-2) and its straightforward
+kernel ran at 13 TFLOP/s, so it was dropped (the note in gemm.metal says what a fast one would take). `--int8` is
+off by default.

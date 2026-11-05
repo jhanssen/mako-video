@@ -48,7 +48,9 @@ yet). Rows at different levels run in one forward.
   AdaLN projection (2688 -> 96768 = 3 modalities x 6 x 5376) and the final layer's (2688 -> 2 x 5376). Row r reads
   the six vectors of its (level, tag) through an offset table (`rms_mod_rows`, `gate_add_rows`). The AdaLN
   projections are 26 GB of the 66 and read once a step (about 50 ms); they are not needed resident, which is the
-  first lever when memory is short.
+  first lever when memory is short. With `--int8`, the chosen block matrices (q / k / v, out, fc1, fc2) are quantized
+  at load to int8 rows with a scale each (all four: 66 -> 47 GB), the activations quantized per row before each
+  projection, and the int8 GEMM runs 1.7x faster; LoRAs merge into the int8 rows by requantizing them.
 - 50 blocks: RMS norm with weight times (1 + scale) plus shift, per row; q / k / v in one GEMM (the shards store the
   fused matrix with each head's rows interleaved, `upload_qkv` stacks them q, k, v so LoRAs land on contiguous rows),
   RMS norms per head, rotary positions, full bidirectional flash attention over 56 heads of 128

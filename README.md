@@ -50,8 +50,10 @@ Options: `-o FILE` (default video.mp4; H.264 with an AAC soundtrack), `--width N
 the model's 16:9 canvas, 1344x768), `--seconds F` or `--frames N` (5 to 15 s at 24 fps, snapped up to 17 n + 5 frames;
 default 124 frames, 5.2 s), `--steps N` (schedule points, one forward each but the last; default 50; 9 with an 8-step
 LoRA, 5 with a 4-step one), `--seed N`, `--lora FILE[:SCALE]` (repeatable, merged into the weights), `--still FILE`
-(the middle frame as a PNG), `--keep-text-encoder`, `--text-encoder DIR`, `--transformer PATH`, `--llm URL`,
-`--llm-api-key KEY`. Each also from `MAKO_VIDEO_<OPTION>` and presets (`--preset NAME`).
+(the middle frame as a PNG), `--int8 LIST` (the transformer blocks' matrices kept as int8: `all`, or some of
+`qkv,out,fc1,fc2`; default none: see docs/performance.md for what it costs), `--keep-text-encoder`,
+`--text-encoder DIR`, `--transformer PATH`, `--llm URL`, `--llm-api-key KEY`. Each also from `MAKO_VIDEO_<OPTION>`
+and presets (`--preset NAME`).
 
 Prompts go in as they are: no chat template, no special tokens around them (the ones written in a prompt, such as
 `<d>`, are recognized as the model's tokenizer has them).

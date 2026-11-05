@@ -104,7 +104,7 @@ H3& Engine::transformer()
     if (!dit_) {
         const auto t0 = Clock::now();
         dit_ = std::make_unique<H3>(opts_.transformer.empty() ? dir_ + "/transformer" : opts_.transformer, ctx_,
-                                    opts_.telemetry);
+                                    opts_.telemetry, opts_.int8);
         log::info("transformer loaded in {:.1f} s", seconds_since(t0));
         for (const Lora& l : loras_)
             dit_->add_lora(l.path, l.scale, true);

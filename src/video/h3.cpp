@@ -42,7 +42,33 @@ safetensors::Files open_files(const std::string& path)
 
 } // namespace
 
-H3::H3(const std::string& path, mtl::Context& ctx, gpu::Telemetry telemetry) : TransformerRuntime(ctx, telemetry)
+std::optional<uint32_t> H3::parse_int8(std::string_view s)
+{
+    if (s == "none" || s.empty())
+        return 0u;
+    if (s == "all")
+        return uint32_t(kInt8All);
+    uint32_t mask = 0;
+    for (size_t at = 0; at <= s.size();) {
+        const size_t comma = std::min(s.find(',', at), s.size());
+        const std::string_view part = s.substr(at, comma - at);
+        if (part == "qkv")
+            mask |= kInt8Qkv;
+        else if (part == "out")
+            mask |= kInt8Out;
+        else if (part == "fc1")
+            mask |= kInt8Fc1;
+        else if (part == "fc2")
+            mask |= kInt8Fc2;
+        else
+            return std::nullopt;
+        at = comma + 1;
+    }
+    return mask;
+}
+
+H3::H3(const std::string& path, mtl::Context& ctx, gpu::Telemetry telemetry, uint32_t int8)
+    : TransformerRuntime(ctx, telemetry), int8_(int8 & kInt8All)
 {
     const auto f = open_files(path);
     // The shards interleave each head's q, k and v rows; the published single files stack them. Nothing in the file
@@ -51,16 +77,25 @@ H3::H3(const std::string& path, mtl::Context& ctx, gpu::Telemetry telemetry) : T
     load(f);
 }
 
-H3::Tensor H3::upload_qkv(const safetensors::Files& f, const std::string& name)
+H3::Tensor H3::upload_qkv(const safetensors::Files& f, const std::string& name, bool int8)
 {
     const auto r = f.find(name);
     if (!r || r.tensor->type != gguf::Type::BF16 || r.tensor->dims.size() != 2 || r.tensor->dims[0] != kDim ||
         r.tensor->dims[1] != kQkv)
         throw std::runtime_error(name + ": not the BF16 [21504][5376] fused q / k / v matrix");
     if (!interleaved_)
-        return upload_raw(r.file->fd(), r.tensor->offset, r.tensor->bytes, gguf::Type::BF16, r.tensor->dims, name, true);
-    Tensor t = reserve(r.tensor->bytes, gguf::Type::BF16, r.tensor->dims);
-    char* dst = static_cast<char*>(t.buf->contents()) + t.off;
+        return int8 ? upload_i8(f, name)
+                    : upload_raw(r.file->fd(), r.tensor->offset, r.tensor->bytes, gguf::Type::BF16, r.tensor->dims,
+                                 name, true);
+    // The restacked rows go straight into the resident BF16 copy, or through the staging buffer when quantized.
+    Tensor t;
+    char* dst;
+    if (int8) {
+        dst = static_cast<char*>(scratch("i8_stage", r.tensor->bytes)->contents());
+    } else {
+        t = reserve(r.tensor->bytes, gguf::Type::BF16, r.tensor->dims);
+        dst = static_cast<char*>(t.buf->contents()) + t.off;
+    }
     const uint64_t row = uint64_t(kDim) * 2, head = 128 * row;
     std::vector<char> tmp(3 * head);
     for (uint32_t h = 0; h < kHeads; ++h) { // head h's [q k v] rows to q, k and v's row blocks
@@ -68,7 +103,7 @@ H3::Tensor H3::upload_qkv(const safetensors::Files& f, const std::string& name)
         for (uint32_t which = 0; which < 3; ++which)
             std::memcpy(dst + (uint64_t(which) * kHeads + h) * head, tmp.data() + which * head, head);
     }
-    return t;
+    return int8 ? quantize_i8(scratch("i8_stage", r.tensor->bytes), 0, kDim, kQkv, r.tensor->dims) : t;
 }
 
 H3::Tensor H3::upload_padded(const safetensors::Files& f, const std::string& name, uint32_t rows)
@@ -90,12 +125,14 @@ H3::Block H3::load_block(const safetensors::Files& f, const std::string& p, bool
     Block B;
     B.norm1 = upload_f32(f, p + "norm1.weight");
     B.norm2 = upload_f32(f, p + "norm2.weight");
-    B.qkv = upload_qkv(f, p + "attn.qkv_proj.weight");
-    B.o = upload(f, p + "attn.out_proj.weight", true);
+    const uint32_t q = modulated ? int8_ : 0; // the refiner's two blocks stay BF16
+    auto matrix = [&](const std::string& n, uint32_t flag) { return q & flag ? upload_i8(f, n) : upload(f, n, true); };
+    B.qkv = upload_qkv(f, p + "attn.qkv_proj.weight", q & kInt8Qkv);
+    B.o = matrix(p + "attn.out_proj.weight", kInt8Out);
     B.norm_q = upload_f32(f, p + "attn.q_norm.weight");
     B.norm_k = upload_f32(f, p + "attn.k_norm.weight");
-    B.fc1 = upload(f, p + "mlp.fc1.weight", true);
-    B.fc2 = upload(f, p + "mlp.fc2.weight", true);
+    B.fc1 = matrix(p + "mlp.fc1.weight", kInt8Fc1);
+    B.fc2 = matrix(p + "mlp.fc2.weight", kInt8Fc2);
     if (B.o.dims[0] != kHeads * 128 || B.o.dims[1] != kDim || B.fc1.dims[0] != kDim || B.fc1.dims[1] != 2 * kFfn ||
         B.fc2.dims[0] != kFfn || B.fc2.dims[1] != kDim || B.norm_q.dims[0] != 128)
         throw std::runtime_error(p + ": unexpected shapes");
@@ -146,8 +183,14 @@ void H3::load(const safetensors::Files& f)
         t2_.dims[0] != kDim || t2_.dims[1] != kTimeDim || final_adaln_.dims[1] != 2 * kDim ||
         video_out_b_.dims[0] != kVideoPatch || audio_out_b_.dims[0] != kAudioChannels)
         throw std::runtime_error("transformer: unexpected shapes");
-    log::info("MiniMax-H3 transformer: {} blocks, {} refiner blocks, {:.1f} GB", blocks_.size(), refiner_.size(),
-              double(dense_bytes_) / 1e9);
+    drop_scratch("i8_stage");
+    std::string int8;
+    for (const auto& [flag, n] : {std::pair{kInt8Qkv, "qkv"}, std::pair{kInt8Out, "out"}, std::pair{kInt8Fc1, "fc1"},
+                                  std::pair{kInt8Fc2, "fc2"}})
+        if (int8_ & flag)
+            int8 += (int8.empty() ? "" : ", ") + std::string(n);
+    log::info("MiniMax-H3 transformer: {} blocks, {} refiner blocks, {:.1f} GB{}", blocks_.size(), refiner_.size(),
+              double(dense_bytes_) / 1e9, int8.empty() ? "" : " (int8: " + int8 + ")");
 }
 
 void H3::block(MTL::ComputeCommandEncoder*& enc, const Block& B, MTL::Buffer* x, uint32_t rows, uint32_t Tg,

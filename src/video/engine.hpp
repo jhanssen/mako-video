@@ -22,6 +22,7 @@ struct Options {
     // Keep the text encoder loaded between generations (49 GB); else it is loaded for each prompt and freed.
     bool keep_text_encoder = false;
     gpu::Telemetry telemetry = gpu::Telemetry::off;
+    uint32_t int8 = 0; // H3::Int8: the transformer blocks' matrices kept as int8
 };
 
 // A LoRA file and its scale, merged into the transformer's weights.

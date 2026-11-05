@@ -1,5 +1,6 @@
 // MiniMax-H3 against the Diffusers implementation's tensors (tools/dump_h3_ref.py: the text encoder in fp32, the
-// transformer with its BF16 weights computed in fp32, 256x256, 124 frames, 2 steps):
+// transformer with its BF16 weights computed in fp32, 256x256, 124 frames, 2 steps); an optional fourth argument
+// is the transformer's int8 matrices (none, all, or some of qkv, out, fc1, fc2) to see what quantization costs:
 //   tokens    the prompt's and other strings' token ids
 //   schedule  the two schedules' sigmas and timesteps
 //   text      the text encoder's 50th layer output
@@ -121,7 +122,16 @@ int main(int argc, char** argv)
     const uint32_t steps = uint32_t(m["steps"].get_number()), size = uint32_t(m["size"].get_number());
     const uint32_t frames = uint32_t(m["num_frames"].get_number());
     mako::mtl::Context ctx;
-    Engine engine(model.string(), ctx);
+    mako::video::Options opts;
+    if (argc > 4) { // the transformer's int8 matrices (H3::parse_int8), to see what the quantization costs
+        const auto m = H3::parse_int8(argv[4]);
+        if (!m) {
+            std::println(stderr, "int8: none, all, or a comma list of qkv, out, fc1, fc2");
+            return 2;
+        }
+        opts.int8 = *m;
+    }
+    Engine engine(model.string(), ctx, opts);
 
     if (mode == "tokens") {
         const auto got = engine.tokenizer().encode(prompt, true);

@@ -3,8 +3,10 @@
 #include "models/runtime.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace mako::video {
@@ -16,8 +18,14 @@ namespace mako::video {
 // the same names (rows stacked q, k, v).
 class H3 final : public models::TransformerRuntime {
 public:
-    // The transformer's directory (its shards and config.json) or a single file.
-    H3(const std::string& path, mtl::Context& ctx, gpu::Telemetry telemetry = gpu::Telemetry::off);
+    // Which of the 50 blocks' matrices are kept as int8 rows with a scale each (the GEMM at 1.7x BF16's rate, half
+    // the bytes; the activations quantized per row before each): a mask of these.
+    enum Int8 : uint32_t { kInt8Qkv = 1, kInt8Out = 2, kInt8Fc1 = 4, kInt8Fc2 = 8, kInt8All = 15 };
+    // "none", "all", or a comma list of qkv, out, fc1 and fc2; nullopt for anything else.
+    static std::optional<uint32_t> parse_int8(std::string_view s);
+
+    // The transformer's directory (its shards and config.json) or a single file; int8: the Int8 mask.
+    H3(const std::string& path, mtl::Context& ctx, gpu::Telemetry telemetry = gpu::Telemetry::off, uint32_t int8 = 0);
 
     const char* name() const override { return "MiniMax-H3"; }
 
@@ -70,7 +78,7 @@ private:
     void load(const safetensors::Files& f);
     Block load_block(const safetensors::Files& f, const std::string& prefix, bool modulated);
     // The fused q / k / v matrix with its rows stacked [q; k; v] (the shards interleave them per head).
-    Tensor upload_qkv(const safetensors::Files& f, const std::string& name);
+    Tensor upload_qkv(const safetensors::Files& f, const std::string& name, bool int8);
     // A small F32 matrix with its rows padded to a multiple of 256, so it runs on the GEMM.
     Tensor upload_padded(const safetensors::Files& f, const std::string& name, uint32_t rows);
     // Attention and the FFN of a block over `rows` rows of x (its first `rows` of Tg), modulated per row from mods
@@ -83,6 +91,7 @@ private:
     Tensor t1_, t1_b_, t2_, t2_b_, final_adaln_, final_adaln_b_, final_norm_, video_out_, video_out_b_, audio_out_,
         audio_out_b_;
     bool interleaved_ = false; // the file's q / k / v rows interleaved per head
+    uint32_t int8_ = 0;        // the Int8 mask
     Layout layout_;
     std::vector<uint32_t> tags_; // a modality tag per row
     uint32_t cond_rows_ = 0, S_ = 0;

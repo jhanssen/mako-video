@@ -1,6 +1,6 @@
 // Text to video with audio with MiniMax-H3 from its original files.
 //   mako_video <model dir> <prompt> [-o out.mp4] [--width N --height N] [--seconds F | --frames N] [--steps N]
-//              [--seed N] [--lora FILE[:SCALE] ...] [--still FILE] [--keep-text-encoder] [--text-encoder DIR]
+//              [--seed N] [--lora FILE[:SCALE] ...] [--still FILE] [--int8 LIST] [--keep-text-encoder] [--text-encoder DIR]
 //              [--transformer PATH] [--llm URL] [--llm-api-key KEY]
 // --width / --height: the canvas in multiples of 32 (default the model's 16:9 canvas, 1344x768). --seconds / --frames:
 // the length, 5 to 15 s at 24 fps, snapped up to 17 n + 5 frames (default 124 frames, 5.2 s). --steps: schedule
@@ -64,6 +64,7 @@ int main(int argc, char** argv)
     double seconds = 0;
     uint64_t seed = 0;
     bool keep_text = false;
+    uint32_t int8 = 0;
     std::vector<mako::video::Lora> loras;
     mako::app::Cli cli("mako_video", "<model dir> <prompt>", 2, 2);
     cli.option("-o", "FILE", "the MP4 to write (default video.mp4)", out)
@@ -86,6 +87,13 @@ int main(int argc, char** argv)
                         throw std::invalid_argument("--telemetry: off, summary, steps, layers or kernels");
                     telemetry = *t;
                 })
+        .option("--int8", "LIST", "the transformer matrices kept as int8: none, all, or some of qkv,out,fc1,fc2 (default none)",
+                [&](const std::string& v) {
+                    const auto m = mako::video::H3::parse_int8(v);
+                    if (!m)
+                        throw std::invalid_argument("--int8: none, all, or a comma list of qkv, out, fc1, fc2");
+                    int8 = *m;
+                })
         .option("--llm", "URL", "a mako_serve on this machine to borrow memory from", llm)
         .option("--llm-api-key", "KEY", "the key that mako_serve wants", llm_key)
         .secret();
@@ -107,7 +115,7 @@ int main(int argc, char** argv)
         }
         mako::mtl::Context ctx;
         mako::video::Engine engine(pos[0], ctx, {.text_encoder = text_encoder, .transformer = transformer,
-                                                 .keep_text_encoder = keep_text, .telemetry = telemetry});
+                                                 .keep_text_encoder = keep_text, .telemetry = telemetry, .int8 = int8});
         for (const auto& l : loras)
             engine.add_lora(l);
         mako::video::Engine::Request r;
