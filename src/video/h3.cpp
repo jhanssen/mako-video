@@ -638,8 +638,8 @@ H3::LoraTarget H3::lora_target(const std::string& module)
         return {&B->fc1, 0, 2 * kFfn, kFfn};
     if (rest == "mlp.fc2")
         return {&B->fc2, 0, kDim};
-    if (rest == "adaln" && B->adaln.buf)
-        return {&B->adaln, 0, kAdaln};
+    if (rest == "adaln" && B->adaln.buf) // on a pruned checkpoint a full model's 2688-wide adapter is skipped
+        return {&B->adaln, 0, kAdaln, 0, curve_};
     return {};
 }
 

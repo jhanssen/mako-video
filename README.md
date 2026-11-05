@@ -79,8 +79,9 @@ and VAEs from the model directory. A merge with a few-step distillation in it ru
     --steps 9 -o out.mp4
 ```
 
-LoRAs made for the full model do not fit a pruned one's 8-wide modulation projections and are refused;
-tools/check_pruned_curve.py checks a pruned file's timestep mapping against the full model.
+A LoRA made for the full model applies to a pruned one except for its modulation keys (the pruned projections take 8
+coordinates, not 2688), which are skipped and counted in the log; most LoRAs adapt only the attention and MLP
+matrices. tools/check_pruned_curve.py checks a pruned file's timestep mapping against the full model.
 
 Prompts go in as they are: no chat template, no special tokens around them (the ones written in a prompt, such as
 `<d>`, are recognized as the model's tokenizer has them).
