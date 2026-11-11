@@ -4,7 +4,7 @@
 #include "text/tokenizer.hpp"
 #include "video/audio_vae.hpp"
 #include "models/qwen_vision.hpp"
-#include "video/h3.hpp"
+#include "models/h3.hpp"
 #include "video/image.hpp"
 #include "video/video_vae.hpp"
 
@@ -17,6 +17,9 @@
 #include <vector>
 
 namespace mako::video {
+
+// The transformer, shared with the image model through mako-common.
+using H3 = models::H3;
 
 struct Options {
     std::string text_encoder; // another directory of the text encoder's safetensors (default: the model's)

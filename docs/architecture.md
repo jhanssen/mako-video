@@ -8,7 +8,7 @@ runtime (`models::TransformerRuntime` from mako-common) with its own weights, so
   text). The transformer conditions on the output of layer 50 before any norm, so only those layers load (49 GB).
   Activations in fp32; the BF16 GEMMs also multiply what rounding the activations to bfloat left out
   (`bf16_split_`), as the image models' text encoders do.
-- `video::H3`: the diffusion transformer (`src/video/h3.cpp`), 20 B parameters without its AdaLN projections, 33 B
+- `models::H3` (mako-common, shared with the image model): the diffusion transformer, 20 B parameters without its AdaLN projections, 33 B
   with.
 - `video::VideoVae`: the video decoder (`src/video/video_vae.cpp`), 2.4 B parameters, F16 here.
 - `video::AudioVae`: the audio decoder (`src/video/audio_vae.cpp`), 65 M parameters, F32.
