@@ -10,7 +10,9 @@ runtime (`models::TransformerRuntime` from mako-common) with its own weights, so
   (`bf16_split_`), as the image models' text encoders do.
 - `models::H3` (mako-common, shared with the image model): the diffusion transformer, 20 B parameters without its AdaLN projections, 33 B
   with.
-- `video::VideoVae`: the video decoder (`src/video/video_vae.cpp`), 2.4 B parameters, F16 here.
+- `models::H3Vae` (mako-common, shared with the image model's VAE, the same model with a smaller decoder): the video
+  VAE, 2.4 B parameters, F16 here; `video::VideoVae` (`src/video/video_vae.cpp`) is its clip-by-clip decoding of a
+  video.
 - `video::AudioVae`: the audio decoder (`src/video/audio_vae.cpp`), 65 M parameters, F32.
 
 `video::Engine` (`src/video/engine.cpp`) holds them, builds the layout and schedules, runs the denoising loop and the
